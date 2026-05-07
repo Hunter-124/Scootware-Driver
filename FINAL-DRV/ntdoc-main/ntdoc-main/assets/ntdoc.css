@@ -1,0 +1,280 @@
+body {
+    /* For sticky footer: https://stackoverflow.com/a/34146411 */
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    margin: 0 auto;
+    padding: 20px 10px;
+    box-sizing: border-box;
+}
+
+.spacer {
+    /* For sticky footer: https://stackoverflow.com/a/34146411 */
+    flex: 1;
+}
+
+/* Virtual select customizations */
+#ntdoc-search-select {
+    height: 60px;
+    width: 100%;
+}
+#ntdoc-search-select .ui-virtual-select--search-input {
+    font-size: 1.6rem;
+    /* fix width 100% to take padding into account */
+    box-sizing: border-box;
+    /* adjust margin added by water.css */
+    margin-bottom: 0;
+}
+#ntdoc-search-select .ui-virtual-select--search-input:focus {
+    /* adjust margin added by water.css */
+    margin-bottom: 2px;
+}
+#ntdoc-search-select .ui-virtual-select--items {
+    /* fix redundant scrollbar */
+    box-sizing: content-box;
+    overflow-y: auto !important;
+    /* keep dropdown list on top */
+    position: relative;
+    z-index: 1;
+    /* use water.css background color */
+    background-color: var(--background-body);
+}
+#ntdoc-search-select .ui-virtual-select--item.active {
+    /* use water.css background color */
+    background-color: var(--background);
+}
+#ntdoc-search-select .ui-virtual-select--loading-indicator {
+    /* use water.css background color */
+    background-color: var(--background-body);
+    /* without this, it's covered by other elements */
+    position: relative;
+}
+#ntdoc-search-select:has(.ui-virtual-select--search-input:not(:focus)) .ui-virtual-select--loading-indicator {
+    display: none !important;
+}
+#ntdoc-search-select:has(.ui-virtual-select--search-input:not(:focus)) .ui-virtual-select--search-input {
+    border-bottom-right-radius: 5px;
+    border-bottom-left-radius: 5px;
+}
+
+.tippy-box[data-theme~='ntdoc'] {
+    font-size: 1em;
+    background-color: color-mix(in srgb, var(--background-body) 20%, black);
+}
+.tippy-box[data-theme~='ntdoc'][data-placement^='top'] .tippy-arrow::before {
+    border-top-color: color-mix(in srgb, var(--background-body) 20%, black);
+}
+.tippy-box[data-theme~='ntdoc'][data-placement^='bottom'] .tippy-arrow::before {
+    border-bottom-color: color-mix(in srgb, var(--background-body) 20%, black);
+}
+.tippy-box[data-theme~='ntdoc'][data-placement^='left'] .tippy-arrow::before {
+    border-left-color: color-mix(in srgb, var(--background-body) 20%, black);
+}
+.tippy-box[data-theme~='ntdoc'][data-placement^='right'] .tippy-arrow::before {
+    border-right-color: color-mix(in srgb, var(--background-body) 20%, black);
+}
+
+.tippy-box[data-theme~='code-preview'] {
+    font-family: monospace;
+    white-space: pre-wrap;
+}
+
+header, footer {
+    text-align: center;
+}
+
+header #ntdoc-search-select {
+    text-align: left;
+    margin-top: 20px;
+    margin-bottom: 7px;
+}
+
+/* dark-mode-toggle customizations */
+footer dark-mode-toggle {
+    display: inline-block;
+    vertical-align: bottom;
+    line-height: 0;
+}
+footer dark-mode-toggle::part(fieldset) {
+    padding: 0;
+}
+
+a {
+    text-decoration: underline;
+}
+
+.ntdoc-title-logo {
+    width: 72px;
+    height: 72px;
+}
+
+.ntdoc-code-elements {
+    position: relative;
+}
+
+/* Can be switched with JavaScript */
+.ntdoc-code-element:not(:first-child) {
+    display: none;
+}
+
+.ntdoc-code-element .ntdoc-code-links {
+    position: sticky;
+    left: 0;
+    /* Reset to body font-family, ugly, I know */
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', sans-serif;
+}
+
+.ntdoc-code-element .ntdoc-code-links a {
+    /* Fixes the external link placement in Firefox */
+    line-height: 0;
+}
+
+.ntdoc-code-header, .ntdoc-code-footer {
+    opacity: 0.6;
+}
+
+.ntdoc-code-control-buttons {
+    position: absolute;
+    right: 2px;
+    top: 21px;
+}
+
+.ntdoc-code-control-buttons button {
+    padding: 8px;
+}
+
+.ntdoc-code-elements .ntdoc-code-control-button-autohide {
+    display: none;
+}
+
+.ntdoc-code-elements:hover .ntdoc-code-control-button-autohide {
+    display: inline-block;
+}
+
+body:has(.ntdoc-inspect-overlay) {
+    overflow: hidden;
+}
+
+.ntdoc-inspect-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.ntdoc-inspect-popup {
+    position: relative;
+    width: 90vw;
+    max-width: 1024px;
+    height: 85vh;
+    background: var(--background-body);
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.ntdoc-inspect-popup iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    border-radius: 6px;
+}
+
+.ntdoc-inspect-close {
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    z-index: 1;
+    font-size: 1.1rem;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border: solid 1px var(--border);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--border) 50%, transparent);
+    border-radius: 50%;
+    font-family: "Courier New", Courier, "Lucida Console", monospace;
+}
+
+.ntdoc-inspect-close:hover {
+    box-shadow: 0 0 16px color-mix(in srgb, var(--border) 50%, transparent);
+}
+
+/* Accessed with JavaScript */
+.ntdoc-description-title {
+    display: none;
+}
+
+.ntdoc-description-title h1 {
+    border-bottom: 2px solid var(--border);
+}
+
+/* Can be switched with JavaScript */
+.ntdoc-description:not(.ntdoc-description-selected) {
+    display: none;
+}
+
+.ntdoc-description h1 {
+    /* Water.css sets h1 to a larger size, reset it to the common browser default */
+    font-size: 2em;
+    border-bottom: 1px solid var(--border);
+}
+
+/* Scrolling tables horizontally: https://stackoverflow.com/a/17776469 */
+.ntdoc-description table {
+    display: block;
+    overflow-x: auto;
+}
+
+/* Improve table style */
+.ntdoc-description td,
+.ntdoc-description th {
+    border: 1px solid var(--border);
+}
+.ntdoc-description tbody tr:nth-child(even) {
+    background-color: var(--background-alt);
+}
+
+.ntdoc-description-none {
+    font-style: italic;
+}
+
+.ntdoc-description-selector {
+    margin-top: 14px;
+    width: 100%;
+}
+
+.ntdoc-changelog-short {
+    background: var(--background);
+    border-radius: 6px;
+    margin-top: 13px;
+    padding: 0 10px 10px;
+    font-size: .85em;
+}
+
+.ntdoc-changelog-short code {
+    background: none;
+    padding: 0;
+}
+
+/* Add icon to external links */
+/* https://christianoliff.com/blog/styling-external-links-with-an-icon-in-css/ */
+/* Prevent word-wrap without text: https://stackoverflow.com/a/38418279 */
+:is(.ntdoc-code-elements, .ntdoc-description, .ntdoc-description-links) a[target="_blank"]::after
+{
+    content: "";
+    background-color: var(--text-main);
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' fill='currentColor' viewBox='0 0 16 16'%3E%3Cpath fill-rule='evenodd' d='M8.636 3.5a.5.5 0 0 0-.5-.5H1.5A1.5 1.5 0 0 0 0 4.5v10A1.5 1.5 0 0 0 1.5 16h10a1.5 1.5 0 0 0 1.5-1.5V7.864a.5.5 0 0 0-1 0V14.5a.5.5 0 0 1-.5.5h-10a.5.5 0 0 1-.5-.5v-10a.5.5 0 0 1 .5-.5h6.636a.5.5 0 0 0 .5-.5z'/%3E%3Cpath fill-rule='evenodd' d='M16 .5a.5.5 0 0 0-.5-.5h-5a.5.5 0 0 0 0 1h3.793L6.146 9.146a.5.5 0 1 0 .708.708L15 1.707V5.5a.5.5 0 0 0 1 0v-5z'/%3E%3C/svg%3E");
+    mask-position: center center;
+    mask-repeat: no-repeat;
+    margin-left: 4px;
+    padding-right: 11px;
+}

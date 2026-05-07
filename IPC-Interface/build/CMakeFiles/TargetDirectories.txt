@@ -1,0 +1,3 @@
+C:/Users/nigga/Desktop/Scootware-Master/Driver/IPC-Interface/build/CMakeFiles/scootware.dir
+C:/Users/nigga/Desktop/Scootware-Master/Driver/IPC-Interface/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/nigga/Desktop/Scootware-Master/Driver/IPC-Interface/build/CMakeFiles/ZERO_CHECK.dir

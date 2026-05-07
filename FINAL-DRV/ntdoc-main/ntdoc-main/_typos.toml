@@ -1,0 +1,27 @@
+[files]
+extend-exclude = [
+    "/descriptions-sources/",
+    "/assets/modules/",
+]
+
+[type.md]
+extend-glob = ["*.md"]
+check-filename = false
+
+extend-ignore-identifiers-re = [
+    # Hardware Abstraction Layer private.
+    "^Halp[A-Z]",
+]
+
+[type.md.extend-identifiers]
+# Microsoft spelling.
+SystemPrioritySeperation = "SystemPrioritySeperation"
+MmWriteableSharedUserData = "MmWriteableSharedUserData"
+# Terminal Services Terminal Server.
+TSTS = "TSTS"
+# Other identifiers.
+RTL_USER_PROC_OPTIN_PROCESS = "RTL_USER_PROC_OPTIN_PROCESS"
+
+[type.md.extend-words]
+# Structured Exception Handling.
+SEH = "SEH"
