@@ -119,16 +119,53 @@
     <ClInclude Include="hwid_spoofer.hpp" />
     <ClInclude Include="imports.h" />
     <ClInclude Include="ipc_config.h" />
-    <ClInclude Include="manual_mapper.h" />
     <ClInclude Include="mouse.hpp" />
     <ClInclude Include="shared_memory_ipc.h" />
     <ClInclude Include="syscall_stack_spoof.h" />
     <ClInclude Include="thread_spoof.h" />
+    <ClInclude Include="injector\injector_api.hpp" />
+    <ClInclude Include="injector\injector_globals_init.hpp" />
+    <ClInclude Include="injector\def\def.hpp" />
+    <ClInclude Include="injector\def\ia32.hpp" />
+    <ClInclude Include="injector\def\globals.hpp" />
+    <ClInclude Include="injector\def\request.hpp" />
+    <ClInclude Include="injector\utils\raii.hpp" />
+    <ClInclude Include="injector\utils\intrin.hpp" />
+    <ClInclude Include="injector\utils\utils.hpp" />
+    <ClInclude Include="injector\mem\phys.hpp" />
+    <ClInclude Include="injector\mem\page_table.hpp" />
+    <ClInclude Include="injector\mem\mem.hpp" />
+    <ClInclude Include="injector\mem\validation.hpp" />
+    <ClInclude Include="injector\mem\detection.hpp" />
+    <ClInclude Include="injector\mem\pt_hook.hpp" />
+    <ClInclude Include="injector\mem\scan.hpp" />
+    <ClInclude Include="injector\mem\hyperspace.hpp" />
+    <ClInclude Include="injector\hde\hde.h" />
+    <ClInclude Include="injector\hde\hde32.h" />
+    <ClInclude Include="injector\hde\hde64.h" />
+    <ClInclude Include="injector\hde\hde_stdint.h" />
+    <ClInclude Include="injector\hde\table32.h" />
+    <ClInclude Include="injector\hde\table64.h" />
+    <ClInclude Include="injector\lib\cli.h" />
+    <ClInclude Include="injector\lib\ia_32.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="driver.cpp" />
     <ClCompile Include="hwid_spoofer.cpp" />
     <ClCompile Include="mouse.cpp" />
+    <ClCompile Include="injector\injector_api.cpp" />
+    <ClCompile Include="injector\def\globals.cpp" />
+    <ClCompile Include="injector\utils\intrin.cpp" />
+    <ClCompile Include="injector\utils\utils.cpp" />
+    <ClCompile Include="injector\mem\phys.cpp" />
+    <ClCompile Include="injector\mem\page_table.cpp" />
+    <ClCompile Include="injector\mem\mem.cpp" />
+    <ClCompile Include="injector\mem\validation.cpp" />
+    <ClCompile Include="injector\mem\detection.cpp" />
+    <ClCompile Include="injector\mem\pt_hook.cpp" />
+    <ClCompile Include="injector\mem\hyperspace.cpp" />
+    <ClCompile Include="injector\hde\hde32.cpp" />
+    <ClCompile Include="injector\hde\hde64.cpp" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="spoof_thunk.asm">

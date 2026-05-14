@@ -99,6 +99,7 @@ typedef struct _IPC_INJECT_DATA {
     UINT64  target_pid;
     UINT64  dll_usermode_ptr;
     UINT32  dll_size;
+    UINT32  alloc_mode;    // one of INJ_ALLOC_* constants (0=between modules default)
 } IPC_INJECT_DATA, *PIPC_INJECT_DATA;
 
 typedef struct _IPC_MODULE_DATA {

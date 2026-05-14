@@ -28,11 +28,15 @@
 // Shared IPC protocol
 #include "shared_memory_ipc.h"
 
-// DLL Manual Mapper
-#include "manual_mapper.h"
-
 // HWID Spoofer
 #include "hwid_spoofer.hpp"
+
+// PT-injector API (C-linkage isolation layer)
+#include "injector/injector_api.hpp"
+
+#ifndef MM_MAX_DLL_SIZE
+#define MM_MAX_DLL_SIZE (32 * 1024 * 1024)
+#endif
 
 // ============================================================================
 // Struct definitions (kept from original driver)
@@ -172,7 +176,7 @@ static PVOID SafePsGetProcessSectionBaseAddress(PEPROCESS p) {
 static PVOID SafePsGetProcessPeb(PEPROCESS p) {
   if (g_pfnPsGetProcessPeb)
     return g_pfnPsGetProcessPeb(p);
-  return PsGetProcessPeb(p); // PsGetProcessPeb IS in the WDK headers
+  return NULL; // dynamic resolve only; static import unavailable under /kernel
 }
 
 #define SystemBigPoolInformation 0x42
@@ -2530,29 +2534,55 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
   }
 
   case CMD_INJECT_DLL: {
-    UINT64 target_p = slot->cmd_data.inject.target_pid;
-    UINT32 dll_size = slot->cmd_data.inject.dll_size;
+    UINT32 target_p  = (UINT32)slot->cmd_data.inject.target_pid;
+    UINT32 dll_size  = slot->cmd_data.inject.dll_size;
+    UINT32 alloc_mode = slot->cmd_data.inject.alloc_mode;
 
-    if (target_p > 0 && dll_size > 0 && dll_size <= MM_MAX_DLL_SIZE) {
-      PVOID kernel_dll_buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, dll_size, 'LLiD');
-      if (kernel_dll_buffer && g_test_process) {
-        NTSTATUS read_status = read_process_memory(
-            g_test_process, slot->cmd_data.inject.dll_usermode_ptr,
-            kernel_dll_buffer, dll_size);
-        if (NT_SUCCESS(read_status)) {
-          PVOID mapped_address = NULL;
-          NTSTATUS map_status = ManualMapper::MapDllIntoProcess(
-              (HANDLE)(ULONG_PTR)target_p, kernel_dll_buffer, dll_size,
-              &mapped_address);
+    if (!target_p || !dll_size || dll_size > MM_MAX_DLL_SIZE)
+      break;
 
-          if (NT_SUCCESS(map_status)) {
-            slot->cmd_data.result.result = (UINT64)mapped_address;
-            final_status = STATUS_IPC_SUCCESS;
-          }
-        }
-        ExFreePool(kernel_dll_buffer);
-      }
+    PVOID kernel_dll = ExAllocatePool2(POOL_FLAG_NON_PAGED, dll_size, 'tJnI');
+    if (!kernel_dll)
+      break;
+
+    NTSTATUS read_st = read_process_memory(
+        g_test_process,
+        slot->cmd_data.inject.dll_usermode_ptr,
+        kernel_dll,
+        dll_size);
+
+    if (!NT_SUCCESS(read_st)) {
+      ExFreePool(kernel_dll);
+      break;
     }
+
+    PVOID  remote_base = NULL;
+    UINT32 local_pid   = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+    NTSTATUS alloc_st  = injector_stealth_alloc(local_pid, target_p, dll_size, alloc_mode, &remote_base);
+    if (!NT_SUCCESS(alloc_st) || !remote_base) {
+      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: stealth alloc failed 0x%X\n", alloc_st);
+      ExFreePool(kernel_dll);
+      break;
+    }
+
+    ULONG    entry_offset = 0;
+    NTSTATUS map_st = injector_map_dll_sections(target_p, remote_base, kernel_dll, dll_size, &entry_offset);
+    if (!NT_SUCCESS(map_st)) {
+      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: map sections failed 0x%X\n", map_st);
+      ExFreePool(kernel_dll);
+      break;
+    }
+
+    ExFreePool(kernel_dll);
+
+    NTSTATUS exec_st = injector_execute_dll(local_pid, target_p, remote_base, entry_offset, alloc_mode);
+    if (!NT_SUCCESS(exec_st)) {
+      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: execute failed 0x%X\n", exec_st);
+      break;
+    }
+
+    slot->cmd_data.result.result = (UINT64)remote_base;
+    final_status = STATUS_IPC_SUCCESS;
     break;
   }
 
@@ -3955,6 +3985,17 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   // via MmGetSystemRoutineAddress so the IPC core can still scan for
   // targets even if the PE import table entries are missing.
   ResolveOptionalImports();
+
+  // ── Initialize PT-injector subsystem ────────────────────────────────
+  {
+    PVOID ntos = GetSystemModuleBase("ntoskrnl");
+    if (ntos) {
+      NTSTATUS inj_st = injector_init(ntos);
+      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] injector_init: 0x%X\n", inj_st);
+    } else {
+      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] injector_init: ntoskrnl base not found\n");
+    }
+  }
 
   // ── Detect EPROCESS.ImageFileName offset ────────────────────────────
   // If dynamic resolution of PsGetProcessImageFileName failed (KDU import
