@@ -119,7 +119,7 @@ namespace mem {
     auto* u2_field = reinterpret_cast<_MIPFNBLINK*>(pfn_entry_addr + 0x18);
     auto* active_field = reinterpret_cast<_MI_ACTIVE_PFN*>(pfn_entry_addr + 0x0);
 
-    if (lock_page) {
+    if (lock_page && globals::mi_lock_page_table_page) {
       auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
       if (!lock_result) {
         log("ERROR", "failed to lock page table page for PFN: 0x%llx", page_frame_number);
@@ -359,11 +359,13 @@ namespace mem {
 
     const auto pfn_entry_addr = *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (pfn);
 
-    // lock in physical memory
-    auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-    if (!lock_result) {
-      log("ERROR", "failed to lock page table page for PFN: 0x%llx", pfn);
-      return 0;
+    // lock in physical memory — skip gracefully if pattern scan missed this build
+    if (globals::mi_lock_page_table_page) {
+      auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
+      if (!lock_result) {
+        log("ERROR", "failed to lock page table page for PFN: 0x%llx", pfn);
+        return 0;
+      }
     }
 
     return base_address;
@@ -441,11 +443,13 @@ namespace mem {
           const auto pfn_entry_addr =
               *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (entry.PageFrameNumber);
 
-          // lock in physical memory
-          auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-          if (!lock_result) {
-            log("ERROR", "failed to lock page table page for PFN: 0x%llx", entry.PageFrameNumber);
-            return 0;
+          // lock in physical memory — skip gracefully if pattern scan missed this build
+          if (globals::mi_lock_page_table_page) {
+            auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
+            if (!lock_result) {
+              log("ERROR", "failed to lock page table page for PFN: 0x%llx", entry.PageFrameNumber);
+              return 0;
+            }
           }
 
           // flush caches

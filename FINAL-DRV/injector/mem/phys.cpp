@@ -68,10 +68,24 @@ namespace physical {
     const uintptr_t page_start_physical = physical_address - page_offset;
     main_page_entry->PageFrame = PAGE_TO_PFN(page_start_physical);
 
-    globals::ke_flush_entire_tb(TRUE, TRUE);  //  ( cr3/cr4 rewrite on all cores )
-    globals::ke_invalidate_all_caches();      // ( __wbinvd on all cores )
-    globals::ke_flush_single_tb(reinterpret_cast<uintptr_t>(main_virtual_address), 0,
-                                1);  // ( __invlpg on all cores )
+    _mm_mfence();
+
+    // Guard each pattern-scanned function: if the scan failed for this build
+    // the pointer is null and a blind call would BSOD with PAGE_FAULT_IN_NONPAGED_AREA.
+    // The local intrinsic fallbacks are sufficient because main_virtual_address is only
+    // accessed from within this driver (no remote-CPU TLB entry to shoot down).
+    if (globals::ke_flush_entire_tb)
+        globals::ke_flush_entire_tb(TRUE, TRUE);
+
+    if (globals::ke_invalidate_all_caches)
+        globals::ke_invalidate_all_caches();
+    else
+        __wbinvd();
+
+    if (globals::ke_flush_single_tb)
+        globals::ke_flush_single_tb(reinterpret_cast<uintptr_t>(main_virtual_address), 0, 1);
+    else
+        intrin::invlpg(main_virtual_address);  // local INVLPG is sufficient for this mapping
 
     return reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(main_virtual_address) + page_offset);
   }
@@ -81,6 +95,11 @@ namespace physical {
     if (!target_address || !buffer || !size) {
       log("ERROR", "invalid parameters - target_address: 0x%llx, buffer: %p, size: 0x%llx",
           target_address, buffer, size);
+      return STATUS_UNSUCCESSFUL;
+    }
+
+    if (!main_page_entry || !main_virtual_address) {
+      log("ERROR", "physical::init() was not called or failed — proxy PTE unavailable");
       return STATUS_UNSUCCESSFUL;
     }
 
