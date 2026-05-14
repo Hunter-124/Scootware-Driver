@@ -18,7 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <timeapi.h>
+#include <commdlg.h>
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -307,42 +309,21 @@ static bool drv_mouse_move(int32_t x, int32_t y, uint16_t btn) {
     return send_command(0, CMD_MOUSE_MOVE, 0, 5000) == WaitResult::Success;
 }
 
-// Inject DLL: usermode places raw DLL bytes into slot data buffer, driver maps it
-static uint64_t drv_inject_dll(uint32_t target_pid, const void* dll_bytes, uint32_t dll_size) {
+// Inject DLL: usermode places raw DLL bytes into the IPC data buffer; driver maps+executes.
+// alloc_mode: INJ_ALLOC_* constant forwarded directly to the injector subsystem.
+static uint64_t drv_inject_dll(uint32_t target_pid, const void* dll_bytes, uint32_t dll_size, uint32_t alloc_mode) {
     if (!dll_bytes || !dll_size || dll_size > 32 * 1024 * 1024) return 0;
-    uint32_t chunk_max = (uint32_t)kSlotDataSize;
-    uint32_t bytes_copied = 0;
-    const uint8_t* src = (const uint8_t*)dll_bytes;
 
-    // We need the full DLL in the data buffer. If it's bigger than one slot, use the whole buffer.
-    // The driver reads from the test process's memory via g_test_process.
-    // We write the DLL into our own IPC buffer; the driver reads it from its mapped view.
-    uint32_t to_copy = (dll_size < chunk_max) ? dll_size : chunk_max;
-    memcpy(slot_data_buffer(0), src, to_copy);
-    bytes_copied = to_copy;
+    // Write DLL bytes into slot 0's data buffer (capped at slot buffer size;
+    // the driver reads from our process VA via read_process_memory).
+    uint32_t to_copy = (dll_size < (uint32_t)kSlotDataSize) ? dll_size : (uint32_t)kSlotDataSize;
+    memcpy(slot_data_buffer(0), dll_bytes, to_copy);
 
-    ((IPC_INJECT_DATA*)slot_cmd_data(0))->target_pid = target_pid;
-    // dll_usermode_ptr: pointer to our own IPC buffer where DLL bytes are.
-    // The driver will use read_process_memory(g_test_process, dll_usermode_ptr, ...)
-    // Since the driver maps our IPC buffer into kernel, dll_usermode_ptr is the VA
-    // of the data_buffer within the test process.
-    // Actually, we need to compute the VA of slot_data_buffer(0) in our process.
-    // But the driver uses g_test_process + MmCopyVirtualMemory to read.
-    // For simplicity, we'll use the data buffer address.
-    // The driver reads from g_test_process (us), using the VA in OUR address space.
-    // Since the IPC buffer is in our process, we can pass the VA of our data_buffer.
-    // The driver's read_process_memory uses CR3 translation to read from our process.
-    // So we need to figure out the virtual address of slot_data_buffer(0) within our process.
-    // That's just (uint64_t)slot_data_buffer(0).
-    // However, the driver has mapped our IPC buffer and access it via g_kernel_ipc_mem.
-    // For CMD_INJECT_DLL, the driver uses read_process_memory with g_test_process.
-    // That means it expects a VA in the test process (us) pointing to the DLL.
-    // We'll pass the offset of data_buffer within the IPC storage, plus the IPC storage address.
-    // Actually, since the driver mapped our IPC buffer and uses read_process_memory on it,
-    // the simplest approach: provide the VA of our IPC buffer's data_buffer[0].
-    // That address is in our process space.
-    ((IPC_INJECT_DATA*)slot_cmd_data(0))->dll_usermode_ptr = (uint64_t)slot_data_buffer(0);
-    ((IPC_INJECT_DATA*)slot_cmd_data(0))->dll_size = dll_size;
+    IPC_INJECT_DATA* inj = (IPC_INJECT_DATA*)slot_cmd_data(0);
+    inj->target_pid      = target_pid;
+    inj->dll_usermode_ptr = (uint64_t)slot_data_buffer(0); // VA in our process space
+    inj->dll_size        = dll_size;
+    inj->alloc_mode      = alloc_mode;
 
     if (send_command(0, CMD_INJECT_DLL, (uint32_t)GetCurrentProcessId(), 15000) != WaitResult::Success)
         return 0;
@@ -731,6 +712,7 @@ static void DrawMemOpsTab();
 static void DrawHWIDTab();
 static void DrawColorValidationTab();
 static void DrawStealthStatusTab();
+static void DrawInjectTab();
 
 // ============================================================================
 // Helper: render a shared log window (used by all tabs)
@@ -802,10 +784,10 @@ int main(int argc, char** argv) {
 
         // ── Tab bar ──
         static int g_active_tab = 0;
-        const char* tabs[] = { "Speed Testing", "Memory Operations", "HWID Spoofing", "Color Validation", "Stealth Status" };
-        for (int i = 0; i < 5; i++) {
+        const char* tabs[] = { "Speed Testing", "Memory Operations", "HWID Spoofing", "Color Validation", "Stealth Status", "DLL Injection" };
+        for (int i = 0; i < 6; i++) {
             if (i > 0) ImGui::SameLine();
-            if (ImGui::Button(tabs[i], ImVec2(165, 28))) g_active_tab = i;
+            if (ImGui::Button(tabs[i], ImVec2(155, 28))) g_active_tab = i;
         }
         ImGui::Separator();
 
@@ -815,6 +797,7 @@ int main(int argc, char** argv) {
             case 2: DrawHWIDTab();              break;
             case 3: DrawColorValidationTab();   break;
             case 4: DrawStealthStatusTab();     break;
+            case 5: DrawInjectTab();            break;
         }
 
         DrawLogWindow();
@@ -1122,32 +1105,6 @@ static void DrawMemOpsTab() {
             else if (drv_free(g_memops.target_pid, g_memops.free_address, MEM_RELEASE)) {
                 LOG_PRINT("[+] Freed 0x%llX", (unsigned long long)g_memops.free_address);
             } else LOG_PRINT("[-] Free failed.");
-        }
-    }
-
-    if (ImGui::CollapsingHeader("DLL Injection", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::InputScalar("Inject Target PID", ImGuiDataType_U64, &g_memops.inject_pid);
-        ImGui::InputText("DLL Path", g_memops.inject_path, sizeof(g_memops.inject_path));
-        if (ImGui::Button("Inject DLL", ImVec2(160, 24))) {
-            if (!g_memops.inject_pid) { LOG_PRINT("[-] Enter a valid target PID."); }
-            else if (!g_memops.inject_path[0]) { LOG_PRINT("[-] Enter DLL path."); }
-            else {
-                HANDLE hFile = CreateFileA(g_memops.inject_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-                if (hFile == INVALID_HANDLE_VALUE) { LOG_PRINT("[-] Cannot open DLL file."); }
-                else {
-                    DWORD dll_size = GetFileSize(hFile, nullptr);
-                    if (dll_size > 0 && dll_size <= 32 * 1024 * 1024) {
-                        std::vector<uint8_t> dll_data(dll_size);
-                        DWORD read = 0;
-                        if (ReadFile(hFile, dll_data.data(), dll_size, &read, nullptr) && read == dll_size) {
-                            uint64_t mapped = drv_inject_dll((uint32_t)g_memops.inject_pid, dll_data.data(), dll_size);
-                            if (mapped) LOG_PRINT("[+] DLL injected at 0x%llX in PID %llu", (unsigned long long)mapped, (unsigned long long)g_memops.inject_pid);
-                            else LOG_PRINT("[-] DLL injection failed.");
-                        } else LOG_PRINT("[-] Failed to read DLL file.");
-                    } else LOG_PRINT("[-] DLL too large or empty.");
-                    CloseHandle(hFile);
-                }
-            }
         }
     }
 
@@ -2001,4 +1958,159 @@ static void DrawStealthStatusTab() {
         "This tab validates: (1) Thread start address spoofing via code caves, "
         "(2) Stack isolation via KeExpandKernelStackAndCalloutEx, "
         "(3) KPTI/KVA Shadow awareness, (4) End-to-end read/write cycle integrity.");
+}
+
+// ============================================================================
+// TAB 6: DLL Injection
+// ============================================================================
+static void DrawInjectTab() {
+    static char  s_dll_path[512]   = "";
+    static UINT64 s_target_pid      = 0;
+    static int   s_alloc_mode       = 1;  // default: between legit modules
+    static uint64_t s_last_result   = 0;
+    static bool  s_last_ok          = false;
+    static bool  s_injected_once    = false;
+
+    // alloc mode labels match INJ_ALLOC_* constants in injector_api.hpp
+    static const char* k_alloc_labels[] = {
+        "0 - Inside Main Module (hijack null PFN)",
+        "1 - Between Legit Modules (recommended)",
+        "2 - At Low Address  (<4 GB non-present PML4)",
+        "3 - At High Address (>128 TB non-present PML4)",
+    };
+
+    ImGui::Text("DLL Injection - PT-injector stealth manual map"); ImGui::Separator();
+
+    // ── Process picker ───────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Target Process", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputScalar("Target PID", ImGuiDataType_U64, &s_target_pid);
+
+        ImGui::SameLine();
+        if (ImGui::Button("Snapshot", ImVec2(100, 22))) {
+            // Populate a quick process list in the log for reference
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe = { sizeof(pe) };
+                LOG_PRINT("[*] Running processes:");
+                if (Process32First(snap, &pe)) {
+                    do {
+                        LOG_PRINT("    PID %-6lu  %s", (unsigned long)pe.th32ProcessID, pe.szExeFile);
+                    } while (Process32Next(snap, &pe));
+                }
+                CloseHandle(snap);
+            }
+        }
+
+        if (s_target_pid) {
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)s_target_pid);
+            if (hProc) {
+                char exe_name[MAX_PATH] = "<unknown>";
+                DWORD sz = MAX_PATH;
+                QueryFullProcessImageNameA(hProc, 0, exe_name, &sz);
+                ImGui::TextColored(ImVec4(0,1,0,1), "Target: %s (PID %llu)", exe_name, (unsigned long long)s_target_pid);
+                CloseHandle(hProc);
+            } else {
+                ImGui::TextColored(ImVec4(1,0.5f,0,1), "PID %llu: cannot open (process gone or no access)", (unsigned long long)s_target_pid);
+            }
+        }
+    }
+
+    // ── DLL selection ────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("DLL", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputText("DLL Path", s_dll_path, sizeof(s_dll_path));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...", ImVec2(90, 22))) {
+            OPENFILENAMEA ofn = {};
+            char file[MAX_PATH] = "";
+            ofn.lStructSize = sizeof(ofn);
+            ofn.lpstrFilter = "DLL Files\0*.dll\0All Files\0*.*\0";
+            ofn.lpstrFile   = file;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            ofn.lpstrTitle  = "Select DLL to inject";
+            if (GetOpenFileNameA(&ofn))
+                strncpy_s(s_dll_path, sizeof(s_dll_path), file, _TRUNCATE);
+        }
+
+        if (s_dll_path[0]) {
+            DWORD attr = GetFileAttributesA(s_dll_path);
+            if (attr == INVALID_FILE_ATTRIBUTES) {
+                ImGui::TextColored(ImVec4(1,0,0,1), "File not found");
+            } else {
+                HANDLE hf = CreateFileA(s_dll_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    DWORD sz = GetFileSize(hf, nullptr);
+                    CloseHandle(hf);
+                    ImGui::TextColored(ImVec4(0,1,0,1), "File OK  (%.1f KB)", sz / 1024.0f);
+                }
+            }
+        }
+    }
+
+    // ── Alloc mode ───────────────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Stealth Allocation Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < 4; i++) {
+            if (ImGui::RadioButton(k_alloc_labels[i], &s_alloc_mode, i))
+                s_alloc_mode = i;
+        }
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1),
+            "Mode 1 (between modules) is the best default.\n"
+            "Mode 0 (inside main module) requires a null PFN slot — not always available.\n"
+            "Modes 2/3 allocate in non-present PML4 regions; very stealthy but may trip\n"
+            "some scanners that enumerate all VADs.");
+    }
+
+    // ── Inject button ────────────────────────────────────────────────────
+    ImGui::Separator();
+    bool can_inject = s_target_pid != 0 && s_dll_path[0] != '\0';
+    if (!can_inject) ImGui::BeginDisabled();
+    bool do_inject = ImGui::Button("  Inject DLL  ", ImVec2(180, 32));
+    if (!can_inject) ImGui::EndDisabled();
+
+    if (!can_inject) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1,0.5f,0,1), "Set target PID and DLL path first.");
+    }
+
+    if (do_inject) {
+        s_last_ok = false; s_last_result = 0; s_injected_once = true;
+        HANDLE hFile = CreateFileA(s_dll_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            LOG_PRINT("[-] Inject: cannot open '%s'  error=%lu", s_dll_path, GetLastError());
+        } else {
+            DWORD dll_size = GetFileSize(hFile, nullptr);
+            if (dll_size == 0 || dll_size > 32 * 1024 * 1024) {
+                LOG_PRINT("[-] Inject: DLL size invalid (%lu bytes).", (unsigned long)dll_size);
+            } else {
+                std::vector<uint8_t> dll_data(dll_size);
+                DWORD bytes_read = 0;
+                if (!ReadFile(hFile, dll_data.data(), dll_size, &bytes_read, nullptr) || bytes_read != dll_size) {
+                    LOG_PRINT("[-] Inject: read error  error=%lu", GetLastError());
+                } else {
+                    LOG_PRINT("[*] Injecting %lu KB into PID %llu (alloc_mode=%d)...",
+                              (unsigned long)(dll_size / 1024), (unsigned long long)s_target_pid, s_alloc_mode);
+                    uint64_t result = drv_inject_dll((uint32_t)s_target_pid, dll_data.data(), dll_size, (uint32_t)s_alloc_mode);
+                    if (result) {
+                        s_last_result = result; s_last_ok = true;
+                        LOG_PRINT("[+] DLL mapped at 0x%llX in PID %llu", (unsigned long long)result, (unsigned long long)s_target_pid);
+                    } else {
+                        LOG_PRINT("[-] Injection failed (driver returned 0). Check DbgView for kernel logs.");
+                    }
+                }
+            }
+            CloseHandle(hFile);
+        }
+    }
+
+    // ── Last result ──────────────────────────────────────────────────────
+    if (s_injected_once) {
+        ImGui::Spacing();
+        if (s_last_ok) {
+            ImGui::TextColored(ImVec4(0,1,0,1), "Last result: MAPPED at 0x%llX", (unsigned long long)s_last_result);
+        } else {
+            ImGui::TextColored(ImVec4(1,0,0,1), "Last result: FAILED");
+            ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "Attach DebugView to see kernel DbgPrint output from the driver.");
+        }
+    }
 }
