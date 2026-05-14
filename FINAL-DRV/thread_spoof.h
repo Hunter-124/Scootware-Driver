@@ -67,6 +67,7 @@ typedef struct _CODE_CAVE {
     PVOID   cave_address;       // VA of the first 0xCC after a 0xC3
     SIZE_T  cave_size;          // Number of consecutive 0xCC bytes found
     BOOLEAN is_valid;           // TRUE if the cave is usable
+    CHAR    module_name[64];    // Short name of the module, e.g. "ntoskrnl.exe"
 } CODE_CAVE, *PCODE_CAVE;
 
 // ============================================================================
@@ -167,6 +168,7 @@ namespace CodeCave {
         *TextStart = nullptr;
         *TextSize  = 0;
         if (!ModuleBase) return STATUS_INVALID_PARAMETER;
+        if (!MmIsAddressValid(ModuleBase)) return STATUS_INVALID_PARAMETER;
 
         PIMAGE_NT_HEADERS pNt = nullptr;
         auto pfnNtHeaderEx = ResolveImageNtHeaderEx();
@@ -377,6 +379,36 @@ namespace CodeCave {
             return STATUS_NOT_SUPPORTED;
         }
 
+        // ─── Pre-flight: validate cave address before raising IRQL ───────────
+        // MmIsAddressValid is reliable for non-paged kernel .text.  A fault
+        // during the HIGH_LEVEL write section is not catchable by SEH and
+        // produces an immediate BSOD — validating here keeps us at PASSIVE.
+        if (!MmIsAddressValid(Cave->cave_address)) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                       "[CR3-IPC] CodeCave: cave %p not accessible — aborting\n",
+                       Cave->cave_address);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        // Re-verify every byte we intend to overwrite is still 0xCC.
+        // Guards against: (a) scanner false-positives (live code that happens
+        // to match the pattern), (b) another component patching the same bytes
+        // between discovery and here.  Either way, writing over live code = BSOD.
+        {
+            const SIZE_T checkLen = (Cave->cave_size < (SIZE_T)CAVE_PATCH_ABS64)
+                                  ? Cave->cave_size : (SIZE_T)CAVE_PATCH_ABS64;
+            const PUCHAR probe = (PUCHAR)Cave->cave_address;
+            for (SIZE_T k = 0; k < checkLen; k++) {
+                if (probe[k] != 0xCC) {
+                    DbgPrintEx(0x4d, 0xffffffff,
+                               "[CR3-IPC] CodeCave: byte[%zu] at %p = 0x%02X "
+                               "(not 0xCC) — may be live code, aborting\n",
+                               k, Cave->cave_address, (unsigned)probe[k]);
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+            }
+        }
+
         // ─── Build the patch ──────────────────────────────────────────────────
         UINT8  patch[CAVE_PATCH_ABS64];
         SIZE_T patchSize = 0;
@@ -438,15 +470,15 @@ namespace CodeCave {
         RtlCopyMemory(Cave->cave_address, patch, patchSize);
 
         __writecr0(cr0);
+
+        // Invalidate the TLB entry for the cave VA on this CPU.  __writecr0
+        // serializes the pipeline (flushes prefetch/decode) but does NOT flush
+        // TLB entries.  __invlpg is safe at HIGH_LEVEL — it is a single
+        // serializing privileged instruction with no side effects.
+        __invlpg(Cave->cave_address);
+
         _enable();
         KeLowerIrql(oldIrql);
-
-        // x86/x64 I-cache is coherent with stores on the same core, and
-        // __writecr0 already serialized this core.  Other cores may have
-        // stale prefetched bytes for this VA, but the cave is dead INT3
-        // padding that no thread touches until our PsCreateSystemThread
-        // dispatches a thread to it — a path that involves a context switch
-        // and therefore a serializing event on the destination CPU.
         KeMemoryBarrier();
 
         DbgPrintEx(0x4d, 0xffffffff,
@@ -490,6 +522,11 @@ namespace CodeCave {
             st = PatchCaveWithJump(&cave, ThreadFunction);
             if (NT_SUCCESS(st)) {
                 *OutCave = cave;
+                // Record which module the cave lives in for diagnostics display.
+                const char* src = g_priority_modules[i];
+                int ni = 0;
+                while (src[ni] && ni < 63) { OutCave->module_name[ni] = src[ni]; ni++; }
+                OutCave->module_name[ni] = '\0';
                 DbgPrintEx(0x4d, 0xffffffff,
                            "[CR3-IPC] CodeCave: SUCCESS — using %s cave at %p\n",
                            g_priority_modules[i], cave.cave_address);

@@ -2915,6 +2915,9 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     diag->cave_address        = (UINT64)(ULONG_PTR)g_thread_cave.cave_address;
     diag->cave_module_base    = (UINT64)(ULONG_PTR)g_thread_cave.module_base;
     diag->cave_size           = (UINT32)g_thread_cave.cave_size;
+    RtlCopyMemory(diag->cave_module_name, g_thread_cave.module_name,
+                  sizeof(diag->cave_module_name) - 1);
+    diag->cave_module_name[sizeof(diag->cave_module_name) - 1] = '\0';
     if (g_thread_cave.cave_address && g_thread_cave.cave_size >= 5) {
       SIZE_T copySz = (g_thread_cave.cave_size < 8) ? g_thread_cave.cave_size : 8;
       memcpy(diag->cave_patch_bytes, g_thread_cave.cave_address, copySz);
@@ -4054,15 +4057,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   }
 
   // ── Code cave thread-spoofing ──────────────────────────────────────
-  // DISABLED by default — MmMapIoSpaceEx-based physical writes to kernel
-  // .text pages can PAGE_FAULT on VBS/HVCI/Secured-core systems where
-  // RAM-backed physical addresses reject IoSpace mappings.
-  //
-  // To re-enable, define CR3_IPC_ENABLE_CAVE_SPOOF before building.
-  // The RET-gadget based return-address spoofing (FindRetGadget above)
-  // and KeExpandKernelStackAndCalloutEx stack isolation provide sufficient
-  // stealth without the code-cave start-address spoof.
-#if defined(CR3_IPC_ENABLE_CAVE_SPOOF)
+  // PatchCaveWithJump uses CR0.WP toggle (not MmMapIoSpaceEx) and gates
+  // on IsHvciActive(), so it is safe to run unconditionally.
   __try {
     CodeCave::FindAndPatchAnyCave((PVOID)ipc_worker_thread, &g_thread_cave);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4071,11 +4067,6 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
                "thread spoofing disabled\n", GetExceptionCode());
     RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   }
-#else
-  DbgPrintEx(0x4d, 0xffffffff,
-             "[CR3-IPC] CodeCave: disabled (CR3_IPC_ENABLE_CAVE_SPOOF not "
-             "defined). RET-gadget + expanded-stack isolation in use.\n");
-#endif
 
   // Initialize HWID spoofer module
   __try {
