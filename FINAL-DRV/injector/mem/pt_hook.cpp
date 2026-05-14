@@ -131,7 +131,7 @@ namespace pt_hook {
    * instructions followed by a jump back to the continuation point. This allows
    * the original function to be called from hook handlers.
    */
-  auto create_trampoline(uintptr_t target_va, uintptr_t target_pa, uint8_t* original_bytes,
+  auto create_trampoline(uintptr_t target_va, uintptr_t, uint8_t* original_bytes,
                          size_t hook_size) -> uintptr_t {
     // alloc memory for trampoline
     auto trampoline = reinterpret_cast<uint8_t*>(mem::allocate_independent_pages(0x100));

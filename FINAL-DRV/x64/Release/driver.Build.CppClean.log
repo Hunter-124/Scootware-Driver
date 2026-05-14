@@ -1,4 +1,17 @@
 c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\vc143.pdb
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\hde64.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\hde32.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\hyperspace.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\pt_hook.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\detection.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\validation.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\mem.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\page_table.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\phys.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\utils.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\intrin.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\globals.obj
+c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\injector_api.obj
 c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\mouse.obj
 c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\hwid_spoofer.obj
 c:\users\nigga\desktop\scootware-master\driver\final-drv\x64\release\driver.obj

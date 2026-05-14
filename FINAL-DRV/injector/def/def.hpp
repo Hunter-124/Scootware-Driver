@@ -22,7 +22,9 @@
 #define to_lower_c(Char) ((Char >= (char*)'A' && Char <= (char*)'Z') ? (Char + 32) : Char)
 
 #define PAGE_SIZE 0x1000
+#ifndef PAGE_SHIFT
 #define PAGE_SHIFT 12
+#endif
 #define PTE_SHIFT 3
 #define VA_SHIFT (63 - 47)
 #define BYTES_TO_PAGES(size) (((size) >> PAGE_SHIFT) + (((size) & (PAGE_SIZE - 1)) != 0))

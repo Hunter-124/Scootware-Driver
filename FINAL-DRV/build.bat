@@ -12,7 +12,7 @@ set "BIN_DIR=%PROJ_DIR%\..\..\..\BIN"
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
   echo ERROR: vswhere.exe not found. Install Visual Studio Build Tools.
-  exit /b 1
+  pause
 )
 
 set "MSBUILD_EXE="
@@ -22,7 +22,7 @@ for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Mic
 
 if not defined MSBUILD_EXE (
   echo ERROR: MSBuild.exe not found via vswhere.
-  exit /b 1
+  pause
 )
 
 echo MSBuild: %MSBUILD_EXE%
@@ -33,13 +33,13 @@ echo [1/2] Building FINAL-DRV (Release ^| x64)...
 "%MSBUILD_EXE%" "%PROJ_DIR%\driver.vcxproj" /m /v:minimal /p:Configuration=Release /p:Platform=x64
 if errorlevel 1 (
   echo ERROR: driver.vcxproj build failed.
-  exit /b 1
+  pause
 )
 
 set "DRV_SYS=%PROJ_DIR%\x64\Release\driver.sys"
 if not exist "%DRV_SYS%" (
   echo ERROR: driver.sys not produced at: %DRV_SYS%
-  exit /b 1
+  pause
 )
 
 :: ── Copy to BIN ────────────────────────────────────────────────────────────────
@@ -49,11 +49,11 @@ if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 copy /y "%DRV_SYS%" "%BIN_DIR%\driver.sys" >nul
 if errorlevel 1 (
   echo ERROR: copy to BIN failed.
-  exit /b 1
+  pause
 )
 
 echo.
 echo Done.
 echo   Built:  %DRV_SYS%
 echo   Output: %BIN_DIR%\driver.sys
-exit /b 0
+pause

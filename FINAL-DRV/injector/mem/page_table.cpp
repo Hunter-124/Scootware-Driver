@@ -95,7 +95,6 @@ namespace page_table {
    */
   auto get_page_information(const void* va, const CR3 cr3) -> PAGE_INFORMATION {
     ADDRESS_TRANSLATION_HELPER helper;
-    UINT32 level;
     PML4E_64 *pml4, *pml4e;
     PDPTE_64 *pdpt, *pdpte;
     PDE_64 *pd, *pde;
@@ -224,7 +223,7 @@ namespace page_table {
         }
 
         // move i forward by the largest shell size found to avoid overlap
-        i += largest_fit;
+        i += static_cast<uint32_t>(largest_fit);
       } else {
         // move to the next address if no space is found at the current location
         ++i;

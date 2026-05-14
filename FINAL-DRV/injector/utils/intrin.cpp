@@ -156,4 +156,12 @@ namespace intrin {
     asm volatile("invlpg (%0)" : : "r"(m) : "memory");
 #endif
   }
+
+  void wbinvd(void) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    __wbinvd();
+#else
+    asm volatile("wbinvd" ::: "memory");
+#endif
+  }
 }  // namespace intrin

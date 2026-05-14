@@ -67,4 +67,6 @@ namespace intrin {
    */
   void invlpg(void* m);
 
+  void wbinvd(void);
+
 }  // namespace intrin

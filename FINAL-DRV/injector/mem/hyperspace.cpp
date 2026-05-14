@@ -56,6 +56,7 @@ namespace hyperspace {
     if (original_func) {
       return original_func(a1);
     }
+    return 0;
   }
 
   /**
@@ -188,7 +189,7 @@ namespace hyperspace {
    * Creates a complete physical copy of the kernel image using individual 4KB
    * pages with proper hiding techniques applied to each page.
    */
-  auto copy_ntoskrnl_pages(uintptr_t src_base, uintptr_t size, uintptr_t dest_pd_pa) -> bool {
+  auto copy_ntoskrnl_pages(uintptr_t src_base, uintptr_t size, uintptr_t) -> bool {
     log("INFO", "copying ntoskrnl as 4KB pages");
 
     size_t page_count = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -349,7 +350,7 @@ namespace hyperspace {
     size_t allocated_page_idx = 0;
 
     for (size_t i = 0; i < total_pages; i++) {
-      uint32_t current_pd_idx = info->pd_index + (i / 512);  // PD index (each PD covers 512 pages)
+      uint32_t current_pd_idx = info->pd_index + static_cast<uint32_t>(i / 512);  // PD index (each PD covers 512 pages)
       uint32_t pt_idx = i % 512;                             // PT index within the PD
 
       if (pt_idx == 0) {
@@ -398,7 +399,7 @@ namespace hyperspace {
 
         // check if it's any of the PT pages we allocated
         for (size_t j = 0; j < total_pages; j += 512) {
-          uint32_t check_pd_idx = info->pd_index + (j / 512);
+          uint32_t check_pd_idx = info->pd_index + static_cast<uint32_t>(j / 512);
           PDE_64 check_pde = {0};
           uintptr_t check_pde_pa = info->new_pd_pa + check_pd_idx * 8;
           if (NT_SUCCESS(physical::read_physical_address(check_pde_pa, &check_pde,
@@ -1031,7 +1032,7 @@ namespace hyperspace {
      * Handles process termination events to trigger automatic cleanup
      * of hyperspace resources when the target process exits.
      */
-    auto process_notify_callback_impl(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create) -> void {
+    auto process_notify_callback_impl(HANDLE, HANDLE ProcessId, BOOLEAN Create) -> void {
       if (InterlockedCompareExchange(reinterpret_cast<LONG*>(&globals::ctx.initialized), FALSE,
                                      TRUE) != TRUE) {
         return;

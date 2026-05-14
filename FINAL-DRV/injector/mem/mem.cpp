@@ -114,12 +114,10 @@ namespace mem {
     const auto pfn_entry_addr =
         *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (page_frame_number);
 
-    auto* e1_field = reinterpret_cast<_MMPFNENTRY1*>(pfn_entry_addr + 0x22);
     auto* e3_field = reinterpret_cast<_MMPFNENTRY3*>(pfn_entry_addr + 0x23);
     auto* u2_field = reinterpret_cast<_MIPFNBLINK*>(pfn_entry_addr + 0x18);
-    auto* active_field = reinterpret_cast<_MI_ACTIVE_PFN*>(pfn_entry_addr + 0x0);
 
-    if (lock_page) {
+    if (lock_page && globals::mi_lock_page_table_page) {
       auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
       if (!lock_result) {
         log("ERROR", "failed to lock page table page for PFN: 0x%llx", page_frame_number);
@@ -359,11 +357,13 @@ namespace mem {
 
     const auto pfn_entry_addr = *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (pfn);
 
-    // lock in physical memory
-    auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-    if (!lock_result) {
-      log("ERROR", "failed to lock page table page for PFN: 0x%llx", pfn);
-      return 0;
+    // lock in physical memory — skip gracefully if pattern scan missed this build
+    if (globals::mi_lock_page_table_page) {
+      auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
+      if (!lock_result) {
+        log("ERROR", "failed to lock page table page for PFN: 0x%llx", pfn);
+        return 0;
+      }
     }
 
     return base_address;
@@ -441,11 +441,13 @@ namespace mem {
           const auto pfn_entry_addr =
               *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (entry.PageFrameNumber);
 
-          // lock in physical memory
-          auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-          if (!lock_result) {
-            log("ERROR", "failed to lock page table page for PFN: 0x%llx", entry.PageFrameNumber);
-            return 0;
+          // lock in physical memory — skip gracefully if pattern scan missed this build
+          if (globals::mi_lock_page_table_page) {
+            auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
+            if (!lock_result) {
+              log("ERROR", "failed to lock page table page for PFN: 0x%llx", entry.PageFrameNumber);
+              return 0;
+            }
           }
 
           // flush caches
@@ -552,7 +554,7 @@ namespace mem {
    * frame numbers and replaces them with hidden physical pages. Dangerous
    * technique that may cause instability.
    */
-  auto hijack_null_pfn(const uint32_t local_pid, const uint32_t target_pid, const size_t size)
+  auto hijack_null_pfn(const uint32_t, const uint32_t target_pid, const size_t size)
       -> void* {
     const size_t page_mask = PAGE_SIZE - 1;
     const size_t aligned_size = (size + page_mask) & ~page_mask;
@@ -767,7 +769,7 @@ namespace mem {
    * Enumerates loaded modules and finds gaps in virtual address space large
    * enough for the requested allocation, then maps hidden pages at that location.
    */
-  auto allocate_between_modules(const uint32_t local_pid, const uint32_t target_pid,
+  auto allocate_between_modules(const uint32_t, const uint32_t target_pid,
                                 const size_t size) -> void* {
     const size_t page_mask = PAGE_SIZE - 1;
     const size_t aligned_size = (size + page_mask) & ~page_mask;
@@ -882,7 +884,7 @@ namespace mem {
    * Finds non-present PML4 entries and creates entirely new virtual address
    * spaces with base address entropy for maximum stealth.
    */
-  auto allocate_at_non_present_pml4e(const uint32_t local_pid, const uint32_t target_pid,
+  auto allocate_at_non_present_pml4e(const uint32_t, const uint32_t target_pid,
                                      const size_t size, const memory_type mem_type,
                                      const bool use_high_address) -> void* {
     const size_t STANDARD_PAGE_SIZE = 0x1000;  // 4KB
