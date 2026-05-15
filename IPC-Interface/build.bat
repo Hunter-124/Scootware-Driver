@@ -13,40 +13,29 @@ if "%TEST_ROOT:~-1%"=="\" set "TEST_ROOT=%TEST_ROOT:~0,-1%"
 
 cd /d "%TEST_ROOT%"
 
+call "%TEST_ROOT%\..\..\build\lib\env.bat"
+if errorlevel 1 (
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
+)
+
 where cmake >nul 2>&1
 if errorlevel 1 (
   echo [-] cmake not found in PATH. Install CMake and ensure it is on PATH.
-  pause
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
 )
-
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
-  echo [-] vswhere.exe not found. Install Visual Studio Build Tools or a VS SKU with MSBuild.
-  pause
-)
-
-set "MSBUILD_EXE="
-for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do (
-  set "MSBUILD_EXE=%%i"
-  goto :msbuild_ok
-)
-echo [-] MSBuild.exe not found via vswhere.
-pause
-
-:msbuild_ok
 
 set "BUILD_DIR=%TEST_ROOT%\build"
 set "CONFIG=Release"
 
-rem Allow "build.bat clean" to blow away the build dir.
 if /I "%~1"=="clean" (
   echo [*] Removing "%BUILD_DIR%"...
   rd /s /q "%BUILD_DIR%" 2>nul
   echo [+] Clean done.
-  pause
+  exit /b 0
 )
 
-rem Allow "build.bat debug" to build a Debug configuration.
 if /I "%~1"=="debug" set "CONFIG=Debug"
 
 echo [*] Configuring speed-test ^(%CONFIG% ^| x64^)...
@@ -56,29 +45,46 @@ if errorlevel 1 (
   rd /s /q "%BUILD_DIR%" 2>nul
   mkdir "%BUILD_DIR%" 2>nul
   cmake -S "%TEST_ROOT%" -B "%BUILD_DIR%" -A x64
-  if errorlevel 1 pause
+  if errorlevel 1 (
+    if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+    exit /b 1
+  )
 )
 
 echo [*] Building speed-test...
 cmake --build "%BUILD_DIR%" --config %CONFIG% -- /m /v:minimal
-if errorlevel 1 pause
+if errorlevel 1 (
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
+)
 
 set "SCOOTWARE_EXE=%BUILD_DIR%\%CONFIG%\scootware.exe"
 
 if not exist "%SCOOTWARE_EXE%" (
   echo [-] ERROR: Expected output not found:
   echo     %SCOOTWARE_EXE%
-  pause
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
 )
 
-echo [*] Copying scootware.exe to "%TEST_ROOT%"...
-copy /Y "%SCOOTWARE_EXE%" "..\%TEST_ROOT%\" >nul
-robocopy "C:\Users\nigga\Desktop\Scootware-Master\Driver\IPC-Interface\build\Release" "C:\Users\nigga\Desktop\Scootware-Master\BIN" scootware.exe
-if errorlevel 1 pause
+echo [*] Copying scootware.exe to "%TEST_ROOT%\"...
+copy /Y "%SCOOTWARE_EXE%" "%TEST_ROOT%\scootware.exe" >nul
+if errorlevel 1 (
+  echo [-] copy to project folder failed.
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
+)
+
+robocopy "%BUILD_DIR%\%CONFIG%" "%BIN%" scootware.exe /NFL /NDL /NJH /NJS /nc /ns /np >nul
+if errorlevel 8 (
+  echo [-] robocopy to BIN failed.
+  if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
+  exit /b 1
+)
 
 echo.
-echo [+] Done. scootware.exe is in "%TEST_ROOT%"
-echo     Run as Administrator (with driver.sys loaded) to start the benchmark:
+echo [+] Done. scootware.exe is in "%TEST_ROOT%" and "%BIN%"
+echo     Run as Administrator (with driver loaded) to start the benchmark:
 echo         scootware.exe --quick
 echo         scootware.exe --csv results.csv
-pause
+exit /b 0
