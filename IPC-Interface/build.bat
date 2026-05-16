@@ -16,14 +16,14 @@ cd /d "%TEST_ROOT%"
 call "%TEST_ROOT%\..\..\build\lib\env.bat"
 if errorlevel 1 (
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 where cmake >nul 2>&1
 if errorlevel 1 (
   echo [-] cmake not found in PATH. Install CMake and ensure it is on PATH.
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 set "BUILD_DIR=%TEST_ROOT%\build"
@@ -33,7 +33,7 @@ if /I "%~1"=="clean" (
   echo [*] Removing "%BUILD_DIR%"...
   rd /s /q "%BUILD_DIR%" 2>nul
   echo [+] Clean done.
-  exit /b 0
+  pause
 )
 
 if /I "%~1"=="debug" set "CONFIG=Debug"
@@ -47,7 +47,7 @@ if errorlevel 1 (
   cmake -S "%TEST_ROOT%" -B "%BUILD_DIR%" -A x64
   if errorlevel 1 (
     if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-    exit /b 1
+    pause
   )
 )
 
@@ -55,7 +55,7 @@ echo [*] Building speed-test...
 cmake --build "%BUILD_DIR%" --config %CONFIG% -- /m /v:minimal
 if errorlevel 1 (
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 set "SCOOTWARE_EXE=%BUILD_DIR%\%CONFIG%\scootware.exe"
@@ -64,7 +64,7 @@ if not exist "%SCOOTWARE_EXE%" (
   echo [-] ERROR: Expected output not found:
   echo     %SCOOTWARE_EXE%
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 echo [*] Copying scootware.exe to "%TEST_ROOT%\"...
@@ -72,14 +72,14 @@ copy /Y "%SCOOTWARE_EXE%" "%TEST_ROOT%\scootware.exe" >nul
 if errorlevel 1 (
   echo [-] copy to project folder failed.
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 robocopy "%BUILD_DIR%\%CONFIG%" "%BIN%" scootware.exe /NFL /NDL /NJH /NJS /nc /ns /np >nul
 if errorlevel 8 (
   echo [-] robocopy to BIN failed.
   if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
-  exit /b 1
+  pause
 )
 
 echo.
@@ -87,4 +87,4 @@ echo [+] Done. scootware.exe is in "%TEST_ROOT%" and "%BIN%"
 echo     Run as Administrator (with driver loaded) to start the benchmark:
 echo         scootware.exe --quick
 echo         scootware.exe --csv results.csv
-exit /b 0
+pause

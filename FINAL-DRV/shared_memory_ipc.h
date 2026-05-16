@@ -68,6 +68,16 @@ typedef uint8_t  UINT8;
 #define CMD_THREAD_VALIDATE     32   // Validate thread Win32StartAddress is spoofed
 #define CMD_CAVE_INFO           33   // Return code cave address, module, patch bytes
 
+// Code-cave step-debugging commands (40-49)
+// Auto-spoofing is disabled in DriverEntry; each step is invoked manually
+// from the GUI so the user can identify which step BSODs on baremetal.
+// State carries across commands via g_thread_cave / KcfgPatch::Resolve cache.
+#define CMD_CAVE_STEP_SCAN          40   // Scan one kernel module for a cave (no patch)
+#define CMD_CAVE_STEP_PATCH         41   // Apply ENDBR64+JMP patch to current cave
+#define CMD_CAVE_STEP_KCFG_RESOLVE  42   // Pattern-decode _guard_dispatch_icall + validate layout
+#define CMD_CAVE_STEP_KCFG_PATCH    43   // Flip CFG bitmap bit for cave_address
+#define CMD_CAVE_STEP_SPAWN         44   // Create a test thread using cave_address as start
+
 // Status codes
 #define STATUS_IPC_IDLE         0
 #define STATUS_IPC_PROCESSING   1
@@ -193,7 +203,7 @@ typedef struct _IPC_STEALTH_STATUS {
     UINT32  expanded_stack_size;       // EXPANDED_STACK_SIZE used for callout
 
     // ── KPTI / KVA Shadow ──────────────────────────────────────────────
-    UINT32  kpti_enabled;             // 1 if CR4.PCIDE set (KPTI active)
+    UINT32  kpti_enabled;             // 1 if KPTI active (UserDTB is a user-shadow CR3, differs from kernel CR3)
     UINT32  cr3_swap_capable;         // 1 if kernel CR3 available (can swap)
     UINT32  cr3_mode;                 // 0=CR3 swap, 1=MDL+attach, 2=expanded stack
 
@@ -212,6 +222,72 @@ typedef struct _IPC_STEALTH_STATUS {
 
     UINT32  reserved[4];             // Future expansion
 } IPC_STEALTH_STATUS, *PIPC_STEALTH_STATUS;
+
+// ─── Cave step-debugging args + result (CMD_CAVE_STEP_*) ────────────────────
+// Input goes through slot->cmd_data.cave_step.  Output goes into
+// slot->data_buffer as IPC_CAVE_STEP_RESULT.  Only the fields relevant to the
+// requested step are populated — others are zeroed.
+
+typedef struct _IPC_CAVE_STEP_CMD {
+    UINT32  module_index;        // SCAN: 0=ntoskrnl 1=hal 2=CI 3=fltmgr
+    UINT32  spawn_wait_ms;       // SPAWN: ms to wait before reporting alive
+    UINT64  reserved[3];
+} IPC_CAVE_STEP_CMD, *PIPC_CAVE_STEP_CMD;
+
+typedef struct _IPC_CAVE_STEP_RESULT {
+    UINT32  step_id;             // The step that produced this result
+    UINT32  ntstatus;            // NTSTATUS from the underlying call
+    UINT64  worker_function_va;  // Address of ipc_worker_thread (always reported)
+
+    // SCAN fields
+    CHAR    scan_module_name[32];
+    UINT64  scan_module_base;
+    UINT64  scan_text_start;
+    UINT64  scan_text_size;
+    UINT64  scan_cave_address;   // 16-byte aligned position
+    UINT64  scan_cave_size;      // patchable bytes after alignment
+    UINT32  scan_aligned;        // 1 if cave_address & 0xF == 0
+    UINT32  scan_reserved;
+
+    // PATCH fields
+    UINT32  patch_size;          // 9 (rel32) or 18 (abs64)
+    UINT32  patch_used_rel32;    // 1 = rel32, 0 = abs64
+    INT64   patch_disp;          // computed displacement
+    UINT8   patch_bytes[18];     // bytes at cave_address after patch
+
+    // KCFG_RESOLVE fields
+    UINT64  kcfg_fptr_loc;
+    UINT64  kcfg_fptr_value;
+    UINT64  kcfg_nop_func;
+    UINT32  kcfg_active;
+    UINT32  kcfg_layout_valid;
+    UINT64  kcfg_bitmap_base_loc;
+    UINT64  kcfg_bitmap_base;
+    CHAR    kcfg_probe_names[4][24];   // 4 probe export names (truncated to 24)
+    UINT64  kcfg_probe_addrs[4];
+    UINT8   kcfg_probe_bits[4];        // 0=clear, 1=set, 0xFF=read failed, 0xFE=not checked
+    UINT8   kcfg_probe_reserved[4];
+    UINT8   kcfg_dispatch_prologue[16]; // First 16 bytes of _guard_dispatch_icall
+
+    // KCFG_PATCH fields
+    UINT64  kcfg_target_addr;
+    UINT64  kcfg_byte_addr;
+    UINT64  kcfg_byte_offset;
+    UINT32  kcfg_bit_in_byte;
+    UINT8   kcfg_byte_before;
+    UINT8   kcfg_byte_after;
+    UINT8   kcfg_patch_reserved[2];
+
+    // SPAWN fields
+    UINT64  spawn_thread_handle;
+    UINT64  spawn_thread_object;
+    UINT32  spawn_create_status;
+    UINT32  spawn_alive;         // 1 if thread is still alive after the delay
+    UINT32  spawn_exit_status;   // exit code if not alive
+    UINT32  spawn_test_ran;     // 1 = test target's first line was reached
+    UINT64  spawn_embedded_target; // abs64 target read back from cave (verification)
+    UINT8   spawn_cave_verify[8];  // first 8 bytes read back from cave before dispatch
+} IPC_CAVE_STEP_RESULT, *PIPC_CAVE_STEP_RESULT;
 
 // ─── RW cycle test data (CMD_RW_CYCLE_TEST) ────────────────────────────
 typedef struct _IPC_RW_CYCLE_RESULT {
@@ -247,6 +323,7 @@ typedef struct _IPC_SLOT {
         IPC_FREE_DATA    free;
         IPC_HWID_CMD     hwid_cmd;
         IPC_HANDOFF_DATA handoff;   // CMD_HANDOFF: cheat PID + IPC VA hint
+        IPC_CAVE_STEP_CMD cave_step; // CMD_CAVE_STEP_*: step-debug args
         UINT8            pad[0x30];
     } cmd_data;                          // 0x18
     

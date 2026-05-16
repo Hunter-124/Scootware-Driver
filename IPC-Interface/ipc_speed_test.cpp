@@ -411,6 +411,52 @@ static bool drv_cave_info(char* report_buf, size_t report_size) {
 }
 
 // ============================================================================
+// Code Cave Step-by-Step Debugging command wrappers
+// ============================================================================
+static bool drv_cave_step_scan(uint32_t module_index, IPC_CAVE_STEP_RESULT* out) {
+    if (!out) return false;
+    IPC_CAVE_STEP_CMD* cmd = (IPC_CAVE_STEP_CMD*)slot_cmd_data(0);
+    cmd->module_index = module_index;
+    cmd->spawn_wait_ms = 0;
+    memset(cmd->reserved, 0, sizeof(cmd->reserved));
+    if (send_command(0, CMD_CAVE_STEP_SCAN, 0, 10000) != WaitResult::Success) return false;
+    memcpy(out, slot_data_buffer(0), sizeof(IPC_CAVE_STEP_RESULT));
+    return true;
+}
+
+static bool drv_cave_step_patch(IPC_CAVE_STEP_RESULT* out) {
+    if (!out) return false;
+    if (send_command(0, CMD_CAVE_STEP_PATCH, 0, 10000) != WaitResult::Success) return false;
+    memcpy(out, slot_data_buffer(0), sizeof(IPC_CAVE_STEP_RESULT));
+    return true;
+}
+
+static bool drv_cave_step_kcfg_resolve(IPC_CAVE_STEP_RESULT* out) {
+    if (!out) return false;
+    if (send_command(0, CMD_CAVE_STEP_KCFG_RESOLVE, 0, 10000) != WaitResult::Success) return false;
+    memcpy(out, slot_data_buffer(0), sizeof(IPC_CAVE_STEP_RESULT));
+    return true;
+}
+
+static bool drv_cave_step_kcfg_patch(IPC_CAVE_STEP_RESULT* out) {
+    if (!out) return false;
+    if (send_command(0, CMD_CAVE_STEP_KCFG_PATCH, 0, 10000) != WaitResult::Success) return false;
+    memcpy(out, slot_data_buffer(0), sizeof(IPC_CAVE_STEP_RESULT));
+    return true;
+}
+
+static bool drv_cave_step_spawn(uint32_t spawn_wait_ms, IPC_CAVE_STEP_RESULT* out) {
+    if (!out) return false;
+    IPC_CAVE_STEP_CMD* cmd = (IPC_CAVE_STEP_CMD*)slot_cmd_data(0);
+    cmd->module_index = 0;
+    cmd->spawn_wait_ms = spawn_wait_ms;
+    memset(cmd->reserved, 0, sizeof(cmd->reserved));
+    if (send_command(0, CMD_CAVE_STEP_SPAWN, 0, 15000) != WaitResult::Success) return false;
+    memcpy(out, slot_data_buffer(0), sizeof(IPC_CAVE_STEP_RESULT));
+    return true;
+}
+
+// ============================================================================
 // Benchmark functions (kept from original)
 // ============================================================================
 struct LatencyStats {
@@ -1808,7 +1854,7 @@ static void DrawStealthStatusTab() {
 
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "--- KPTI / KVA Shadow ---");
-            ImGui::Text("  KPTI Enabled:      %s", stealth.kpti_enabled ? "YES (CR4.PCIDE set)" : "NO");
+            ImGui::Text("  KPTI Enabled:      %s", stealth.kpti_enabled ? "YES (UserDTB is shadow CR3)" : "NO (UserDTB == kernel CR3)");
             ImGui::Text("  CR3 Swap Capable:   %s", stealth.cr3_swap_capable ? "YES (kernel CR3)" : "NO (user shadow CR3)");
             const char* mode_names[] = { "CR3 Swap (stealthiest)", "MDL Direct (detectable)", "MDL + Expanded Stack" };
             ImGui::Text("  Active RW Mode:     %s", mode_names[stealth.cr3_mode > 2 ? 1 : stealth.cr3_mode]);
@@ -1922,33 +1968,265 @@ static void DrawStealthStatusTab() {
 
         if (cycle_run) {
             ImGui::Separator();
-            const char* mode_names[] = { "CR3 Swap (stealthiest)", "MDL + Expanded Stack", "MDL Direct (detectable)" };
-            ImGui::Text("  Mode Used:      %s", mode_names[cycle.mode_used > 2 ? 2 : cycle.mode_used]);
-            ImGui::Text("  Test Address:   0x%llX", (unsigned long long)cycle.test_address);
-            ImGui::Text("  Test Size:      %u bytes", cycle.test_size);
 
-            ImGui::TextColored(cycle.write_success ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
-                               "  Write:          %s", cycle.write_success ? "SUCCESS" : "FAILED");
-            ImGui::TextColored(cycle.read_success ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
-                               "  Read:           %s", cycle.read_success ? "SUCCESS" : "FAILED");
-            ImGui::TextColored(cycle.data_match ? ImVec4(0,1,0,1) : ImVec4(1,0.5f,0,1),
-                               "  Data Match:     %s", cycle.data_match ? "YES (correct)" : "NO (corrupted!)");
+            // mode_used == 0xFF means no target was attached when the test ran
+            // (g_test_process was NULL). Display it explicitly instead of
+            // clamping 0xFF to index 2 ("MDL Direct"), which was misleading.
+            if (cycle.mode_used == 0xFF) {
+                ImGui::TextColored(ImVec4(1,0.5f,0,1),
+                    "  Mode Used:      SKIPPED (no target attached — run CMD_RESOLVE_DTB first)");
+            } else {
+                const char* mode_names[] = { "CR3 Swap (stealthiest)", "MDL + Expanded Stack", "MDL Direct (detectable)" };
+                ImGui::Text("  Mode Used:      %s", mode_names[cycle.mode_used > 2 ? 2 : cycle.mode_used]);
+                ImGui::Text("  Test Address:   0x%llX", (unsigned long long)cycle.test_address);
+                ImGui::Text("  Test Size:      %u bytes", cycle.test_size);
 
-            // Show pattern comparison
-            char hex_wr[128], hex_rd[128];
-            int pw = 0, pr = 0;
-            for (int i = 0; i < __min(16, (int)cycle.test_size); i++) {
-                pw += _snprintf_s(hex_wr + pw, sizeof(hex_wr) - pw, _TRUNCATE, "%02X ", cycle.written_pattern[i]);
-                pr += _snprintf_s(hex_rd + pr, sizeof(hex_rd) - pr, _TRUNCATE, "%02X ", cycle.readback_pattern[i]);
+                ImGui::TextColored(cycle.write_success ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
+                                   "  Write:          %s", cycle.write_success ? "SUCCESS" : "FAILED");
+                ImGui::TextColored(cycle.read_success ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
+                                   "  Read:           %s", cycle.read_success ? "SUCCESS" : "FAILED");
+                ImGui::TextColored(cycle.data_match ? ImVec4(0,1,0,1) : ImVec4(1,0.5f,0,1),
+                                   "  Data Match:     %s", cycle.data_match ? "YES (correct)" : "NO (corrupted!)");
+
+                // Show pattern comparison
+                char hex_wr[128], hex_rd[128];
+                int pw = 0, pr = 0;
+                for (int i = 0; i < __min(16, (int)cycle.test_size); i++) {
+                    pw += _snprintf_s(hex_wr + pw, sizeof(hex_wr) - pw, _TRUNCATE, "%02X ", cycle.written_pattern[i]);
+                    pr += _snprintf_s(hex_rd + pr, sizeof(hex_rd) - pr, _TRUNCATE, "%02X ", cycle.readback_pattern[i]);
+                }
+                ImGui::Text("  Written:        %s", hex_wr);
+                ImGui::Text("  Readback:       %s", hex_rd);
+
+                // Latency
+                ImGui::Text("  Write Latency:  ~%llu ns (%.1f us)", (unsigned long long)cycle.write_latency_ns,
+                           (double)cycle.write_latency_ns / 1000.0);
+                ImGui::Text("  Read Latency:   ~%llu ns (%.1f us)", (unsigned long long)cycle.read_latency_ns,
+                           (double)cycle.read_latency_ns / 1000.0);
             }
-            ImGui::Text("  Written: %s", hex_wr);
-            ImGui::Text("  Readback: %s", hex_rd);
+        }
+    }
 
-            // Latency
-            ImGui::Text("  Write Latency: ~%llu ns (%.1f us)", (unsigned long long)cycle.write_latency_ns,
-                       (double)cycle.write_latency_ns / 1000.0);
-            ImGui::Text("  Read Latency:  ~%llu ns (%.1f us)", (unsigned long long)cycle.read_latency_ns,
-                       (double)cycle.read_latency_ns / 1000.0);
+    // ── Code Cave Step-by-Step Debugging ─────────────────────────────────
+    if (ImGui::CollapsingHeader("Code Cave Step-by-Step Debugging")) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), 
+            "WARNING: These commands manually control cave scanning, patching, and CFG bitmap manipulation.");
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), 
+            "Use only for debugging BSOD issues on bare metal. Auto-spoofing should be disabled in DriverEntry.");
+        ImGui::Separator();
+
+        static IPC_CAVE_STEP_RESULT cave_result = {};
+        static bool cave_result_valid = false;
+        static int selected_module = 0;
+        static int spawn_wait_ms = 1000;
+
+        const char* module_names[] = { "ntoskrnl.exe", "hal.dll", "CI.dll", "fltmgr.sys" };
+        
+        // ── Step 1: Scan for Cave ──
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Step 1: Scan for Code Cave");
+        ImGui::Combo("Module to Scan", &selected_module, module_names, 4);
+        
+        if (ImGui::Button("Scan Module", ImVec2(180, 28))) {
+            if (drv_cave_step_scan(selected_module, &cave_result)) {
+                cave_result_valid = true;
+                LOG_PRINT("[+] Cave scan complete. Module: %s, Cave: 0x%llX, Size: %llu bytes, Aligned: %s",
+                         cave_result.scan_module_name,
+                         (unsigned long long)cave_result.scan_cave_address,
+                         (unsigned long long)cave_result.scan_cave_size,
+                         cave_result.scan_aligned ? "YES" : "NO");
+            } else {
+                LOG_PRINT("[-] Cave scan failed.");
+                cave_result_valid = false;
+            }
+        }
+
+        if (cave_result_valid && cave_result.step_id == CMD_CAVE_STEP_SCAN) {
+            ImGui::Indent();
+            ImGui::Text("Module: %s", cave_result.scan_module_name);
+            ImGui::Text("Module Base: 0x%llX", (unsigned long long)cave_result.scan_module_base);
+            ImGui::Text(".text Start: 0x%llX", (unsigned long long)cave_result.scan_text_start);
+            ImGui::Text(".text Size: 0x%llX", (unsigned long long)cave_result.scan_text_size);
+            ImGui::TextColored(cave_result.scan_cave_address ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
+                             "Cave Address: 0x%llX", (unsigned long long)cave_result.scan_cave_address);
+            ImGui::Text("Cave Size: %llu bytes", (unsigned long long)cave_result.scan_cave_size);
+            ImGui::Text("16-byte Aligned: %s", cave_result.scan_aligned ? "YES" : "NO");
+            ImGui::Text("Worker Function: 0x%llX", (unsigned long long)cave_result.worker_function_va);
+            ImGui::Unindent();
+        }
+
+        ImGui::Separator();
+
+        // ── Step 2: Patch Cave ──
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Step 2: Patch Code Cave");
+        ImGui::Text("Applies ENDBR64 + JMP patch to the cave found in Step 1.");
+        
+        if (ImGui::Button("Patch Cave", ImVec2(180, 28))) {
+            if (drv_cave_step_patch(&cave_result)) {
+                cave_result_valid = true;
+                LOG_PRINT("[+] Cave patch complete. Patch size: %u bytes, Type: %s",
+                         cave_result.patch_size,
+                         cave_result.patch_used_rel32 ? "REL32" : "ABS64");
+            } else {
+                LOG_PRINT("[-] Cave patch failed.");
+                cave_result_valid = false;
+            }
+        }
+
+        if (cave_result_valid && cave_result.step_id == CMD_CAVE_STEP_PATCH) {
+            ImGui::Indent();
+            ImGui::Text("Patch Size: %u bytes", cave_result.patch_size);
+            ImGui::Text("Patch Type: %s", cave_result.patch_used_rel32 ? "REL32 (short jump)" : "ABS64 (long jump)");
+            ImGui::Text("Displacement: %lld (0x%llX)", (long long)cave_result.patch_disp, (unsigned long long)cave_result.patch_disp);
+            
+            char patch_hex[128] = "";
+            int pos = 0;
+            for (int i = 0; i < cave_result.patch_size && i < 18; i++) {
+                pos += _snprintf_s(patch_hex + pos, sizeof(patch_hex) - pos, _TRUNCATE, "%02X ", cave_result.patch_bytes[i]);
+            }
+            ImGui::Text("Patch Bytes: %s", patch_hex);
+            ImGui::Unindent();
+        }
+
+        ImGui::Separator();
+
+        // ── Step 3: KCFG Resolve ──
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Step 3: Resolve KCFG (Kernel Control Flow Guard)");
+        ImGui::Text("Pattern-decode _guard_dispatch_icall and validate CFG bitmap layout.");
+        
+        if (ImGui::Button("Resolve KCFG", ImVec2(180, 28))) {
+            if (drv_cave_step_kcfg_resolve(&cave_result)) {
+                cave_result_valid = true;
+                LOG_PRINT("[+] KCFG resolve complete. Active: %s, Layout Valid: %s",
+                         cave_result.kcfg_active ? "YES" : "NO",
+                         cave_result.kcfg_layout_valid ? "YES" : "NO");
+            } else {
+                LOG_PRINT("[-] KCFG resolve failed.");
+                cave_result_valid = false;
+            }
+        }
+
+        if (cave_result_valid && cave_result.step_id == CMD_CAVE_STEP_KCFG_RESOLVE) {
+            ImGui::Indent();
+            ImGui::TextColored(cave_result.kcfg_active ? ImVec4(1,0.8f,0,1) : ImVec4(0,1,0,1),
+                             "KCFG Active: %s", cave_result.kcfg_active ? "YES (CFG enabled)" : "NO (CFG disabled)");
+            if (cave_result.kcfg_layout_valid == 2) {
+                ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1), "Layout Valid: N/A (CFG inactive, no bitmap)");
+            } else {
+                ImGui::TextColored(cave_result.kcfg_layout_valid ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1),
+                                 "Layout Valid: %s", cave_result.kcfg_layout_valid ? "YES" : "NO");
+            }
+            ImGui::Text("Function Pointer Location: 0x%llX", (unsigned long long)cave_result.kcfg_fptr_loc);
+            ImGui::Text("Function Pointer Value: 0x%llX", (unsigned long long)cave_result.kcfg_fptr_value);
+            ImGui::Text("NOP Function: 0x%llX", (unsigned long long)cave_result.kcfg_nop_func);
+            ImGui::Text("Bitmap Base Location: 0x%llX", (unsigned long long)cave_result.kcfg_bitmap_base_loc);
+            ImGui::Text("Bitmap Base: 0x%llX", (unsigned long long)cave_result.kcfg_bitmap_base);
+
+            // Show dispatch function prologue bytes for diagnosis.
+            if (cave_result.kcfg_dispatch_prologue[0]) {
+                char prologue_str[64]; int ps = 0;
+                for (int i = 0; i < 16 && ps < 60; i++) {
+                    ps += snprintf(prologue_str + ps, sizeof(prologue_str) - ps,
+                                   "%02X ", cave_result.kcfg_dispatch_prologue[i]);
+                }
+                ImGui::Text("Dispatch Prologue: %s", prologue_str);
+            }
+
+            ImGui::Text("Probe Exports:");
+            for (int i = 0; i < 4; i++) {
+                if (cave_result.kcfg_probe_names[i][0]) {
+                    const char* bit_status =
+                        cave_result.kcfg_probe_bits[i] == 0xFE ? "N/A (CFG inactive)" :
+                        cave_result.kcfg_probe_bits[i] == 0xFF ? "READ FAILED" :
+                        cave_result.kcfg_probe_bits[i] == 1 ? "SET" : "CLEAR";
+                    ImVec4 color = cave_result.kcfg_probe_bits[i] == 0xFE ? ImVec4(0.5f,0.5f,0.5f,1) :
+                                  cave_result.kcfg_probe_bits[i] == 0xFF ? ImVec4(1,0,0,1) :
+                                  cave_result.kcfg_probe_bits[i] == 1 ? ImVec4(0,1,0,1) : ImVec4(1,1,0,1);
+                    ImGui::TextColored(color, "  %s @ 0x%llX: %s",
+                              cave_result.kcfg_probe_names[i],
+                              (unsigned long long)cave_result.kcfg_probe_addrs[i],
+                              bit_status);
+                }
+            }
+            ImGui::Unindent();
+        }
+
+        ImGui::Separator();
+
+        // ── Step 4: KCFG Patch ──
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Step 4: Patch KCFG Bitmap");
+        ImGui::Text("Flip the CFG bitmap bit for the cave address to allow indirect calls.");
+        
+        if (ImGui::Button("Patch KCFG Bitmap", ImVec2(180, 28))) {
+            if (drv_cave_step_kcfg_patch(&cave_result)) {
+                cave_result_valid = true;
+                LOG_PRINT("[+] KCFG bitmap patch complete. Byte 0x%02X -> 0x%02X",
+                         cave_result.kcfg_byte_before,
+                         cave_result.kcfg_byte_after);
+            } else {
+                LOG_PRINT("[-] KCFG bitmap patch failed.");
+                cave_result_valid = false;
+            }
+        }
+
+        if (cave_result_valid && cave_result.step_id == CMD_CAVE_STEP_KCFG_PATCH) {
+            ImGui::Indent();
+            ImGui::Text("Target Address: 0x%llX", (unsigned long long)cave_result.kcfg_target_addr);
+            ImGui::Text("Bitmap Byte Address: 0x%llX", (unsigned long long)cave_result.kcfg_byte_addr);
+            ImGui::Text("Byte Offset: 0x%llX", (unsigned long long)cave_result.kcfg_byte_offset);
+            ImGui::Text("Bit in Byte: %u", cave_result.kcfg_bit_in_byte);
+            ImGui::Text("Byte Before: 0x%02X", cave_result.kcfg_byte_before);
+            ImGui::TextColored(ImVec4(0,1,0,1), "Byte After:  0x%02X", cave_result.kcfg_byte_after);
+            ImGui::Unindent();
+        }
+
+        ImGui::Separator();
+
+        // ── Step 5: Spawn Test Thread ──
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Step 5: Spawn Test Thread");
+        ImGui::Text("Create a test thread using the cave address as the start address.");
+        ImGui::InputInt("Wait Time (ms)", &spawn_wait_ms);
+        
+        if (ImGui::Button("Spawn Test Thread", ImVec2(180, 28))) {
+            if (drv_cave_step_spawn(spawn_wait_ms, &cave_result)) {
+                cave_result_valid = true;
+                LOG_PRINT("[+] Thread spawn complete. Handle: 0x%llX, Alive: %s",
+                         (unsigned long long)cave_result.spawn_thread_handle,
+                         cave_result.spawn_alive ? "YES" : "NO");
+            } else {
+                LOG_PRINT("[-] Thread spawn failed.");
+                cave_result_valid = false;
+            }
+        }
+
+        if (cave_result_valid && cave_result.step_id == CMD_CAVE_STEP_SPAWN) {
+            ImGui::Indent();
+            ImGui::Text("Thread Handle: 0x%llX", (unsigned long long)cave_result.spawn_thread_handle);
+            ImGui::Text("Thread Object: 0x%llX", (unsigned long long)cave_result.spawn_thread_object);
+            ImGui::Text("Create Status: 0x%08X", cave_result.spawn_create_status);
+            ImGui::Text("NTSTATUS: 0x%08X", cave_result.ntstatus);
+            ImGui::Text("Test Target Ran: %s", cave_result.spawn_test_ran ? "YES" : "NO");
+            if (cave_result.spawn_embedded_target) {
+                ImGui::Text("Embedded Target: 0x%llX", (unsigned long long)cave_result.spawn_embedded_target);
+                ImGui::Text("Expected Target: 0x%llX", (unsigned long long)cave_result.worker_function_va);
+            }
+            if (cave_result.spawn_cave_verify[0]) {
+                ImGui::Text("Cave Verify: %02X %02X %02X %02X %02X %02X %02X %02X",
+                    cave_result.spawn_cave_verify[0], cave_result.spawn_cave_verify[1],
+                    cave_result.spawn_cave_verify[2], cave_result.spawn_cave_verify[3],
+                    cave_result.spawn_cave_verify[4], cave_result.spawn_cave_verify[5],
+                    cave_result.spawn_cave_verify[6], cave_result.spawn_cave_verify[7]);
+            }
+            if (cave_result.spawn_alive) {
+                ImGui::TextColored(ImVec4(0,1,0,1), "Thread Alive: YES");
+            } else if (cave_result.spawn_exit_status == 0xDEAD0001) {
+                ImGui::TextColored(ImVec4(1,0,0,1), "Thread CRASHED before reaching test target");
+                ImGui::TextColored(ImVec4(1,0.5f,0,1), "Likely cause: CFG/CET/IBT enforcement or bad JMP target");
+            } else if (cave_result.spawn_test_ran && cave_result.spawn_exit_status == 0) {
+                ImGui::TextColored(ImVec4(0,1,0,1), "Thread ran and exited cleanly (SUCCESS)");
+            } else {
+                ImGui::TextColored(ImVec4(1,1,0,1), "Thread Alive: NO  Exit: 0x%08X", cave_result.spawn_exit_status);
+            }
+            ImGui::Unindent();
         }
     }
 

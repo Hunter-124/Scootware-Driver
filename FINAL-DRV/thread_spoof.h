@@ -50,6 +50,7 @@
 
 #include <ntifs.h>
 #include <ntimage.h>
+#include <intrin.h>  // __cpuid for CodeCave_SerializeAllCpus
 
 // Forward declaration: physical::write_physical is defined in CR3.h (included
 // before this header in driver.cpp). The namespace is brought in scope via
@@ -71,19 +72,49 @@ typedef struct _CODE_CAVE {
 } CODE_CAVE, *PCODE_CAVE;
 
 // ============================================================================
-// Patch sizes:
-//   5 bytes  — JMP rel32  (E9 dd dd dd dd)         used when |disp| <= 2 GB
-//  14 bytes  — JMP [rip+0] + 8-byte absolute       used otherwise
+// Patch sizes — every patch begins with a 4-byte ENDBR64 prefix.
 //
-// Scanner requires at least RUN_MIN consecutive 0xCC bytes to qualify a cave.
-// Compiler-emitted INT3 padding is typically 8–15 bytes; demanding RUN_MIN=14
-// rejects the vast majority of "0xC3 followed by an immediate that happens to
-// be 0xCC" false positives that would otherwise have us patching live code.
+//   ENDBR64  =  F3 0F 1E FA      ; 4-byte NOP on pre-CET CPUs
+//                                 ; mandatory IBT landing pad on CET CPUs
+//
+// Why ENDBR64 is mandatory:
+//   PspSystemThreadStartup invokes the registered KSTART_ROUTINE through an
+//   indirect branch (call qword ptr [...]).  When the CPU supports CET-IBT
+//   AND Windows has enabled Kernel-CET (default on Win10 21H2+ / Win11 on
+//   11th-gen Intel & Zen4+ AMD), every indirect-branch target must begin
+//   with ENDBR64 or the CPU raises #CP (Control-flow Protection).  Windows
+//   surfaces #CP as either:
+//       KMODE_EXCEPTION_NOT_HANDLED   (0x1E)  param1 = 0xC0000409, or
+//       KERNEL_SECURITY_CHECK_FAILURE (0x139) param1 = 0x27 / 0x39
+//   on the very first dispatch of the spoofed thread.
+//
+//   This was the BSOD seen immediately after the cave was re-enabled in
+//   605f93c.  The patch path was hardened, but the dispatch path still
+//   landed on a bare 0xE9 (JMP rel32) which IBT correctly rejects.
+//
+//   Real ntoskrnl/HAL/CI exports all begin with ENDBR64; the cave entry has
+//   to look the same.  The prefix decodes as a no-op on CPUs without CET,
+//   so emitting it unconditionally is safe.
+//
+//   9 bytes  — ENDBR64 + JMP rel32     (F3 0F 1E FA  E9 dd dd dd dd)
+//  18 bytes  — ENDBR64 + JMP [rip+0] + 8-byte absolute target
+//
+// CAVE_RUN_MIN is bumped to 18 so the abs64 form always fits.  Compiler
+// padding runs of 18 bytes still occur frequently in ntoskrnl (.text after
+// large leaf functions); the priority module list (ntoskrnl → hal → CI →
+// fltmgr) almost always finds a hit on the first module.
 // ============================================================================
-#define CAVE_PATCH_REL32  5
-#define CAVE_PATCH_ABS64  14
+#define CAVE_PATCH_ENDBR  4
+#define CAVE_PATCH_REL32  (CAVE_PATCH_ENDBR + 5)    //  9 bytes
+#define CAVE_PATCH_ABS64  (CAVE_PATCH_ENDBR + 14)   // 18 bytes
 #define CAVE_MIN_SIZE     CAVE_PATCH_REL32
-#define CAVE_RUN_MIN      14
+// CAVE_RUN_MIN must accommodate worst-case 16-byte alignment slack PLUS the
+// abs64 patch: up to 15 bytes are skipped to reach a 16-byte boundary, then
+// 18 bytes are needed for ENDBR + JMP[rip+0] + abs64.  Kernel CFG fast-fails
+// any indirect-call target that isn't 16-aligned (`test cl, 0Fh`), so the
+// scanner must hand back a 16-aligned cave_address — and any byte run shorter
+// than 33 bytes can't guarantee one with enough patch space after.
+#define CAVE_RUN_MIN      33
 
 // ============================================================================
 // Forward declarations for RtlImageNtHeaderEx (undocumented but stable since Win8)
@@ -192,9 +223,13 @@ namespace CodeCave {
 
         PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
         for (USHORT i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-            // .text section is always the first section in kernel modules,
-            // but we check by name for safety.
-            if (memcmp(pSec[i].Name, ".text", 5) == 0) {
+            // Exact ".text\0\0\0" match.  Section names are an 8-byte field
+            // (IMAGE_SIZEOF_SHORT_NAME); a 5-byte memcmp would also accept
+            // ".textbss" (uninitialized RW, would BSOD on write) or hypothetical
+            // ".text$mn" sub-sections.  Final linked kernel images use just
+            // ".text", so require all 8 bytes to match.
+            static const UCHAR kDotText[8] = { '.','t','e','x','t', 0, 0, 0 };
+            if (memcmp(pSec[i].Name, kDotText, 8) == 0) {
                 *TextStart = (PUCHAR)ModuleBase + pSec[i].VirtualAddress;
                 *TextSize  = pSec[i].Misc.VirtualSize;
                 return STATUS_SUCCESS;
@@ -204,11 +239,101 @@ namespace CodeCave {
     }
 
     // ============================================================================
-    // Scan a memory range for a code cave: a 0xC3 (RET) immediately followed by
-    // at least `min_cave_bytes` of consecutive 0xCC (INT3).
+    // Cross-CPU instruction-stream synchronization after self-modifying code.
     //
-    // Returns the number of valid 0xCC bytes starting at (pRet + 1).
-    // Set *out_cave_start to the first 0xCC after the RET.
+    // Intel SDM Vol. 3 §8.1.3 "Cross-Modifying Code" — when one logical
+    // processor writes to a code region that another logical processor will
+    // later execute, BOTH processors must execute a serializing instruction
+    // between the write and the execute.  __writecr0 serializes only the
+    // writing CPU.
+    //
+    // ─── Why we DON'T use KeIpiGenericCall here ────────────────────────────────
+    // The obvious primitive (broadcast a CPUID callback to every CPU) raises
+    // each CPU to IPI_LEVEL and then transfers control to the callback.  At
+    // IPI_LEVEL the kernel forbids paging in any code page — if the callback's
+    // page is in pageable backing (which manually-mapped drivers commonly are,
+    // and whose PTE state is unpredictable on a remote CPU), the IPI bugchecks
+    // with DRIVER_PORTION_MUST_BE_NONPAGED (0xD3).  This is exactly what
+    // happened the first time around.
+    //
+    // ─── What we do instead ────────────────────────────────────────────────────
+    // Run the serializing instruction at PASSIVE_LEVEL on the CURRENT thread,
+    // bouncing across every active CPU via group affinity.  Each step:
+    //   1. KeSetSystemGroupAffinityThread → request the next CPU.
+    //   2. KeDelayExecutionThread → force a quantum boundary so the scheduler
+    //      actually migrates us (affinity sets are honored asynchronously
+    //      otherwise; without the yield we might run CPUID on the wrong CPU).
+    //   3. CPUID → strongest serializer in x86-64; flushes the instruction
+    //      prefetch/decode pipeline on this CPU.
+    //   4. KeRevertToUserGroupAffinityThread → restore for the next iteration.
+    //
+    // Since we run entirely at PASSIVE_LEVEL on our own thread, no page-fault
+    // restriction applies — driver pages page in normally if they happen to
+    // be in pageable backing.
+    //
+    // Belt-and-suspenders note: thread dispatch on each target CPU eventually
+    // involves an IRETQ to the cave_address, which is itself a serializing
+    // instruction per Intel SDM Vol. 3 §8.3.  So in practice the spoofed
+    // worker's CPU is going to serialize anyway.  We do the explicit sweep
+    // because:
+    //   (a) IRETQ-serialization happens AT dispatch time, not before — there
+    //       is technically a window where stale prefetch from neighbouring
+    //       reads could matter on aggressive prefetchers.
+    //   (b) Some Windows builds use SYSRET-equivalent paths whose serializing
+    //       semantics are CPU-dependent; CPUID is unconditionally serializing.
+    //   (c) The sweep is a one-shot cost at DriverEntry — ~1 ms per CPU.
+    // ============================================================================
+    __forceinline VOID CodeCave_SerializeAllCpus() {
+        ULONG cpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        if (cpuCount == 0) return;
+
+        // 1 ms delay — long enough to guarantee the scheduler observes the
+        // new affinity and migrates us.  Negative value = relative time in
+        // 100-ns ticks.
+        LARGE_INTEGER migrateDelay;
+        migrateDelay.QuadPart = -10000LL;  // 1 ms
+
+        for (ULONG idx = 0; idx < cpuCount; idx++) {
+            PROCESSOR_NUMBER procNum;
+            if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(idx, &procNum)))
+                continue;
+
+            GROUP_AFFINITY ga;
+            RtlZeroMemory(&ga, sizeof(ga));
+            ga.Mask  = (KAFFINITY)1ULL << procNum.Number;
+            ga.Group = procNum.Group;
+
+            GROUP_AFFINITY oldGa;
+            KeSetSystemGroupAffinityThread(&ga, &oldGa);
+
+            // Yield so the scheduler migrates us to the requested CPU.  Without
+            // this, KeSetSystemGroupAffinityThread is a hint that takes effect
+            // at the next reschedule and we'd CPUID on the wrong CPU.
+            KeDelayExecutionThread(KernelMode, FALSE, &migrateDelay);
+
+            // CPUID is unconditionally serializing.  Leaf 0 is universally
+            // supported and side-effect-free.  Executes here on the target CPU
+            // at PASSIVE_LEVEL — any pageable code we touched faults in normally.
+            int regs[4];
+            __cpuid(regs, 0);
+
+            KeRevertToUserGroupAffinityThread(&oldGa);
+        }
+    }
+
+    // ============================================================================
+    // Scan a memory range for a code cave: a 0xC3 (RET) followed by a
+    // consecutive 0xCC (INT3) run long enough that a 16-byte-aligned offset
+    // within it has at least CAVE_PATCH_ABS64 bytes of patch space remaining.
+    //
+    // Kernel CFG (`_guard_dispatch_icall`) fast-fails any indirect-call target
+    // that isn't 16-byte aligned via `test cl, 0Fh`, so the returned
+    // cave_address MUST be 16-aligned.  We scan for runs ≥ CAVE_RUN_MIN (33)
+    // bytes, then advance to the first 16-aligned position inside the run.
+    //
+    // Returns the number of patchable bytes from the 16-aligned cave start
+    // through the end of the 0xCC run.  *OutCaveStart receives the 16-aligned
+    // VA itself.
     // ============================================================================
     __forceinline SIZE_T FindCaveInRange(
         _In_ PUCHAR Start,
@@ -222,22 +347,50 @@ namespace CodeCave {
         // Require RUN_MIN consecutive 0xCC bytes to qualify — short runs
         // (1–4 bytes) can be immediates inside a real instruction, and
         // patching one of those replaces live code → BSOD on next dispatch.
+        // RUN_MIN also accommodates worst-case 16-byte alignment slack so we
+        // can always find an aligned position inside the run with enough
+        // patch space after it.
         const SIZE_T runMin = (MinCaveSize > CAVE_RUN_MIN) ? MinCaveSize : CAVE_RUN_MIN;
         if (Length < (runMin + 1)) return 0;
 
         for (SIZE_T i = 0; i <= Length - (runMin + 1); i++) {
             if (Start[i] != 0xC3) continue;
 
+            // Count the 0xCC run immediately after the RET.
             SIZE_T cc_count = 0;
             for (SIZE_T j = i + 1; j < Length && Start[j] == 0xCC; j++) {
                 cc_count++;
             }
-            if (cc_count >= runMin) {
-                *OutCaveStart = &Start[i + 1];
-                return cc_count;
+            if (cc_count < runMin) {
+                // Run too short — skip past it and resume scanning.
+                i += cc_count;
+                continue;
             }
-            // Resume scanning past the 0xCC run we just walked.
-            i += cc_count;
+
+            PUCHAR runStart  = &Start[i + 1];
+            PUCHAR runEnd    = runStart + cc_count;
+
+            // Advance runStart to the next 16-byte-aligned position.
+            ULONG_PTR runStartVA  = (ULONG_PTR)runStart;
+            ULONG_PTR alignOffset = (16 - (runStartVA & 0xF)) & 0xF;
+            PUCHAR    alignedStart = runStart + alignOffset;
+
+            // Verify that the aligned position is still inside the run AND
+            // has at least CAVE_PATCH_ABS64 bytes of 0xCC after it.
+            if (alignedStart >= runEnd) {
+                i += cc_count;
+                continue;
+            }
+            SIZE_T usable = (SIZE_T)(runEnd - alignedStart);
+            if (usable < (SIZE_T)CAVE_PATCH_ABS64) {
+                // Worst case shouldn't hit this given runMin = 33, but
+                // defend against future changes to the constants.
+                i += cc_count;
+                continue;
+            }
+
+            *OutCaveStart = alignedStart;
+            return usable;
         }
         return 0;
     }
@@ -410,35 +563,51 @@ namespace CodeCave {
         }
 
         // ─── Build the patch ──────────────────────────────────────────────────
+        // Layout (every patch shape):
+        //   [0..3]   ENDBR64           ; F3 0F 1E FA   — IBT landing pad
+        //   [4..]    JMP form          ; rel32 (5B) or abs64 indirect (14B)
+        //
+        // The cave_address itself is what gets handed to PsCreateSystemThread
+        // as the start routine, so the FIRST byte the dispatcher's indirect
+        // call lands on must be ENDBR64.  See the patch-size comment block for
+        // the full BSOD rationale.
         UINT8  patch[CAVE_PATCH_ABS64];
         SIZE_T patchSize = 0;
 
+        // ENDBR64 prefix — always emitted, NOP on pre-CET CPUs.
+        patch[0] = 0xF3; patch[1] = 0x0F; patch[2] = 0x1E; patch[3] = 0xFA;
+
         const ULONG_PTR caveVa = (ULONG_PTR)Cave->cave_address;
+        const ULONG_PTR jmpVa  = caveVa + CAVE_PATCH_ENDBR;     // JMP starts after ENDBR64
         const ULONG_PTR tgtVa  = (ULONG_PTR)TargetFunction;
-        const INT64     disp64 = (INT64)(tgtVa - (caveVa + 5));
+        // rel32 displacement is anchored at the byte AFTER the JMP, i.e.
+        // jmpVa + 5 = caveVa + 9.  Anchoring at caveVa + 5 (the old code) would
+        // off-by-four and land the JMP four bytes short of the real function.
+        const INT64     disp64 = (INT64)(tgtVa - (jmpVa + 5));
 
         if (disp64 >= (INT64)INT32_MIN && disp64 <= (INT64)INT32_MAX &&
             Cave->cave_size >= CAVE_PATCH_REL32) {
-            patch[0] = 0xE9;
+            patch[4] = 0xE9;
             INT32 disp = (INT32)disp64;
-            patch[1] = (UINT8)(disp & 0xFF);
-            patch[2] = (UINT8)((disp >>  8) & 0xFF);
-            patch[3] = (UINT8)((disp >> 16) & 0xFF);
-            patch[4] = (UINT8)((disp >> 24) & 0xFF);
+            patch[5] = (UINT8)(disp & 0xFF);
+            patch[6] = (UINT8)((disp >>  8) & 0xFF);
+            patch[7] = (UINT8)((disp >> 16) & 0xFF);
+            patch[8] = (UINT8)((disp >> 24) & 0xFF);
             patchSize = CAVE_PATCH_REL32;
             DbgPrintEx(0x4d, 0xffffffff,
-                       "[CR3-IPC] CodeCave: rel32 patch %p -> %p (disp=0x%X)\n",
+                       "[CR3-IPC] CodeCave: ENDBR+rel32 patch %p -> %p (disp=0x%X)\n",
                        Cave->cave_address, TargetFunction, disp);
         } else if (Cave->cave_size >= CAVE_PATCH_ABS64) {
             // FF 25 00 00 00 00  ; jmp qword ptr [rip+0]
-            patch[0] = 0xFF; patch[1] = 0x25;
-            patch[2] = 0x00; patch[3] = 0x00; patch[4] = 0x00; patch[5] = 0x00;
+            //  <8-byte absolute target follows immediately>
+            patch[4] = 0xFF; patch[5] = 0x25;
+            patch[6] = 0x00; patch[7] = 0x00; patch[8] = 0x00; patch[9] = 0x00;
             for (int i = 0; i < 8; i++) {
-                patch[6 + i] = (UINT8)((tgtVa >> (i * 8)) & 0xFF);
+                patch[10 + i] = (UINT8)((tgtVa >> (i * 8)) & 0xFF);
             }
             patchSize = CAVE_PATCH_ABS64;
             DbgPrintEx(0x4d, 0xffffffff,
-                       "[CR3-IPC] CodeCave: abs64 patch %p -> %p\n",
+                       "[CR3-IPC] CodeCave: ENDBR+abs64 patch %p -> %p\n",
                        Cave->cave_address, TargetFunction);
         } else {
             // Target unreachable via rel32 and cave too small for abs64.
@@ -452,37 +621,91 @@ namespace CodeCave {
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        // ─── Write at HIGH_LEVEL with WP cleared, interrupts off ─────────────
-        // High IRQL keeps the scheduler off our back; _disable() blocks
-        // maskable interrupts so no other code on this CPU runs while WP is
-        // clear.  __writecr0 itself is a serializing instruction, which both
-        // commits the WP change and flushes the prefetch queue.
-        KIRQL oldIrql;
-        KeRaiseIrql(HIGH_LEVEL, &oldIrql);
-        _disable();
+        // ─── Primary: MmMapIoSpace write ──────────────────────────────────
+        // Map the physical page backing the cave as a new writable VA.
+        // This bypasses CR0.WP entirely and works under boot-time hypervisors
+        // that shadow CR0 (e.g. EfiGuard).  Falls back to CR0.WP if
+        // MmMapIoSpace fails (e.g. old builds, unusual memory configs).
+        BOOLEAN writeOk = FALSE;
 
-        const ULONG_PTR cr0  = __readcr0();
-        const ULONG_PTR WP   = (ULONG_PTR)0x10000;   // CR0.WP = bit 16
-        __writecr0(cr0 & ~WP);
+        PHYSICAL_ADDRESS cavePa = MmGetPhysicalAddress(Cave->cave_address);
+        if (cavePa.QuadPart != 0) {
+            ULONG_PTR pageOff = (ULONG_PTR)Cave->cave_address & (PAGE_SIZE - 1);
+            PHYSICAL_ADDRESS pagePA;
+            pagePA.QuadPart = cavePa.QuadPart - (LONGLONG)pageOff;
 
-        // RtlCopyMemory is a __movsb-style copy — non-paged, IRQL-agnostic,
-        // and our destination is locked into kernel .text.
-        RtlCopyMemory(Cave->cave_address, patch, patchSize);
+            PVOID mapped = MmMapIoSpace(pagePA, PAGE_SIZE, MmNonCached);
+            if (mapped) {
+                PVOID writeDst = (PUCHAR)mapped + pageOff;
+                RtlCopyMemory(writeDst, patch, patchSize);
+                MmUnmapIoSpace(mapped, PAGE_SIZE);
+                writeOk = TRUE;
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] CodeCave: wrote %zu bytes via MmMapIoSpace "
+                           "(PA=%llX)\n", patchSize, cavePa.QuadPart);
+            } else {
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] CodeCave: MmMapIoSpace failed for PA=%llX "
+                           "— falling back to CR0.WP\n", cavePa.QuadPart);
+            }
+        }
 
-        __writecr0(cr0);
+        // ─── Fallback: CR0.WP toggle at HIGH_LEVEL ──────────────────────────
+        // Works on bare hardware without a hypervisor.  Fails under boot-time
+        // hypervisors that shadow CR0.WP, which is why MmMapIoSpace is tried
+        // first.
+        if (!writeOk) {
+            KIRQL oldIrql;
+            KeRaiseIrql(HIGH_LEVEL, &oldIrql);
+            _disable();
 
-        // Invalidate the TLB entry for the cave VA on this CPU.  __writecr0
-        // serializes the pipeline (flushes prefetch/decode) but does NOT flush
-        // TLB entries.  __invlpg is safe at HIGH_LEVEL — it is a single
-        // serializing privileged instruction with no side effects.
+            const ULONG_PTR cr0  = __readcr0();
+            const ULONG_PTR WP   = (ULONG_PTR)0x10000;
+            __writecr0(cr0 & ~WP);
+
+            RtlCopyMemory(Cave->cave_address, patch, patchSize);
+
+            __writecr0(cr0);
+            __invlpg(Cave->cave_address);
+
+            _enable();
+            KeLowerIrql(oldIrql);
+        }
+
+        // Flush TLB for the original .text VA and issue a full memory barrier
+        // so all CPUs see the new instructions.
         __invlpg(Cave->cave_address);
-
-        _enable();
-        KeLowerIrql(oldIrql);
         KeMemoryBarrier();
 
+        // ─── Cross-CPU serialize — intentionally NOT done here ───────────────
+        // Earlier revisions of this code attempted an explicit cross-CPU
+        // serialization sweep here (first via KeIpiGenericCall, then via an
+        // affinity-bouncing CPUID loop).  Both BSOD'd:
+        //   - IPI variant → DRIVER_PORTION_MUST_BE_NONPAGED (0xD3): the
+        //     callback runs at IPI_LEVEL on remote CPUs, where pageable
+        //     driver code can't fault in.  Manually-mapped drivers have
+        //     unpredictable PTE-resident state for their image backing.
+        //   - Affinity-shift variant → KMODE_EXCEPTION_NOT_HANDLED (0x1E):
+        //     bouncing the driver-loader thread across CPUs during
+        //     DriverEntry destabilized something in the loader path.
+        //
+        // We rely on the natural serializer instead: per Intel SDM Vol. 3
+        // §8.3, IRETQ is unconditionally serializing, and the kernel
+        // dispatches every new thread by IRETQ-ing into its start routine.
+        // That means the executing CPU's instruction pipeline is fully
+        // serialized immediately before fetching our patched cave bytes —
+        // the cross-modifying-code contract is satisfied without our help.
+        //
+        // If a future revision discovers a real coherence problem on some
+        // CPU family, CodeCave_SerializeAllCpus() is kept defined above for
+        // re-use, BUT it must only be called from a context that owns its
+        // own thread (e.g., a dedicated system thread spawned for the
+        // purpose) — never from DriverEntry's calling context.
+
         DbgPrintEx(0x4d, 0xffffffff,
-                   "[CR3-IPC] CodeCave: patch applied (%zu bytes)\n", patchSize);
+                   "[CR3-IPC] CodeCave: patch applied (%zu bytes) at %p, "
+                   "target=%p (relying on IRETQ-induced dispatch serialize)\n",
+                   patchSize, Cave->cave_address, TargetFunction);
         return STATUS_SUCCESS;
     }
 

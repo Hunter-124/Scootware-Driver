@@ -655,6 +655,7 @@ typedef struct _RTL_PROCESS_MODULES {
 // are defined so the code-cave scanner and syscall resolver can use them.
 #include "thread_spoof.h"
 #include "syscall_stack_spoof.h"
+#include "kcfg_patch.h"  // depends on IsHvciActive from thread_spoof.h
 
 bool kernel_strstr(const char *str, const char *sub) {
   if (!str || !sub)
@@ -737,7 +738,28 @@ static BOOLEAN g_kpti_enabled = FALSE;
 static BOOLEAN g_cr3_swap_capable = FALSE;
 
 static BOOLEAN detect_kpti() {
-  return (BOOLEAN)((__readcr4() >> 17) & 1);
+  // CR4.PCIDE (bit 17) is the Process-Context Identifiers Enable flag.
+  // It is set by Windows on virtually all modern CPUs regardless of KPTI
+  // status — it does NOT indicate KPTI (Kernel Page Table Isolation).
+  //
+  // Correct detection: on KPTI-enabled systems, UserDirectoryTableBase in
+  // EPROCESS holds a user-shadow CR3 that differs from DirectoryTableBase.
+  // On KPTI-disabled systems (common on gaming hardware / inline hypervisors),
+  // UserDTB equals DirectoryTableBase, or is a trivial sentinel (0, 1).
+  //
+  // We check PsInitialSystemProcess as a stable, always-present reference.
+  // Note: do_resolve_dtb Stage 2 performs a more authoritative per-target
+  // kernel VA probe — this function is a fast initial hint only.
+  PEPROCESS sys = PsInitialSystemProcess;
+  if (!sys) return FALSE;
+  ULONG user_off = (ULONG)get_winver();
+  if (!user_off || user_off == 0x28) return FALSE; // offset unknown or same field
+  uintptr_t dtb  = *(uintptr_t *)((PUCHAR)sys + 0x28);
+  uintptr_t udtb = *(uintptr_t *)((PUCHAR)sys + user_off);
+  // Non-KPTI: UserDTB is 0, 1, or equal to the kernel CR3
+  if (!udtb || udtb == 1 || udtb == dtb) return FALSE;
+  // UserDTB differs substantially — KPTI shadow table present
+  return TRUE;
 }
 
 bool is_cr3_invalid(uintptr_t cr3) { return (cr3 >> 0x38) == 0x40; }
@@ -971,10 +993,15 @@ static NTSTATUS rw_via_cr3_swap(UINT64 target_cr3, UINT64 va,
 
   // ── Phase 6: copy ─────────────────────────────────────────────────────
   // PTE is confirmed Present. Window to fault is ~5 instructions.
+  //
+  // `va` is the original user virtual address (current_va from do_read_write)
+  // and already encodes the byte offset within the page.  Do NOT add
+  // offset_in_page again — doing so would advance the pointer by (va & 0xFFF)
+  // extra bytes and corrupt every non-page-aligned access.
   if (is_write) {
-    RtlCopyMemory((PUCHAR)(ULONG_PTR)(va + offset_in_page), buffer, chunk);
+    RtlCopyMemory((PUCHAR)(ULONG_PTR)va, buffer, chunk);
   } else {
-    RtlCopyMemory(buffer, (PUCHAR)(ULONG_PTR)(va + offset_in_page), chunk);
+    RtlCopyMemory(buffer, (PUCHAR)(ULONG_PTR)va, chunk);
   }
 
   // ── Phase 7: restore ──────────────────────────────────────────────────
@@ -1377,8 +1404,9 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
     g_kpti_enabled = detect_kpti();
     kpti_checked   = TRUE;
     DbgPrintEx(0x4d, 0xffffffff,
-               "[CR3-IPC] KPTI detection: CR4.PCIDE=%d → g_kpti_enabled=%d\n",
-               (int)g_kpti_enabled, (int)g_kpti_enabled);
+               "[CR3-IPC] KPTI pre-check (PsInitialSystemProcess DTB compare): "
+               "g_kpti_enabled=%d (authoritative result set in Stage 2)\n",
+               (int)g_kpti_enabled);
   }
 
   // ── Stage 1: EPROCESS.DirectoryTableBase (offset 0x28) ─────────────────
@@ -1423,13 +1451,34 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
       UINT64 phys_check2 = translate_linearBE(dtb_stage2, section_base);
       if (phys_check2) {
         physical::m_stored_dtb = dtb_stage2;
-        // Safe for CR3 swap only when KPTI is disabled (UserDTB == kernel CR3).
-        g_cr3_swap_capable     = !g_kpti_enabled;
-        g_cr3_cached_pid       = process_id;
+
+        // ── Authoritative KPTI / swap-capability check ────────────────────
+        // Instead of trusting a per-boot PCID heuristic, we probe a known
+        // non-paged kernel VA through dtb_stage2.
+        //
+        // If dtb_stage2 is a FULL kernel CR3 (KPTI off / EAC-spoofed DTB),
+        // the probe succeeds — every kernel address is mapped.
+        //
+        // If dtb_stage2 is a KPTI user-shadow CR3, the probe fails — the
+        // shadow CR3 only maps user pages + minimal kernel stubs; it does
+        // NOT map the kernel's data region or driver pool pages.
+        //
+        // &PsInitialSystemProcess is in ntoskrnl's non-paged .data section —
+        // always resident, always present in any real kernel CR3, never
+        // present in a KPTI shadow CR3.
+        UINT64 kern_probe = translate_linearBE(
+            dtb_stage2,
+            (UINT64)(ULONG_PTR)&PsInitialSystemProcess);
+        g_cr3_swap_capable = (kern_probe != 0);
+        // Update the global KPTI flag to match the authoritative result.
+        g_kpti_enabled     = !g_cr3_swap_capable;
+
+        g_cr3_cached_pid   = process_id;
         DbgPrintEx(0x4d, 0xffffffff,
                    "[CR3-IPC] Stage2 UserDirectoryTableBase validated: "
-                   "0x%llx (swap_capable=%d)\n",
-                   dtb_stage2, (int)g_cr3_swap_capable);
+                   "0x%llx kern_probe=0x%llx → swap_capable=%d kpti=%d\n",
+                   dtb_stage2, kern_probe,
+                   (int)g_cr3_swap_capable, (int)g_kpti_enabled);
         ObDereferenceObject(process);
         *out_dtb = physical::m_stored_dtb;
         return STATUS_SUCCESS;
@@ -1951,12 +2000,19 @@ static NTSTATUS write_via_proxy_pte(PEPROCESS process, UINT64 va,
   // ---- Phase 2: MmMapLockedPagesSpecifyCache → memcpy → unmap -------------
   //
   // Plain kernel VA mapping; no IoSpace tag, no PT-page hijack.
+  //
+  // MmMapLockedPagesSpecifyCache returns a kernel VA with the SAME byte
+  // offset as the MDL's start address (MDL->ByteOffset == va & 0xFFF).
+  // Adding offset_in_page a second time would corrupt every non-page-aligned
+  // access by advancing the destination pointer by (va & 0xFFF) extra bytes.
+  // Use kmapped directly — it already points at the exact byte described by
+  // the MDL.
   NTSTATUS status = STATUS_UNSUCCESSFUL;
   PVOID kmapped = MmMapLockedPagesSpecifyCache(
-      mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+      mdl, KernelMode, MmCached, NULL, FALSE, HighPagePriority);
   if (kmapped) {
     __try {
-      RtlCopyMemory((PUCHAR)kmapped + offset_in_page, buffer, chunk);
+      RtlCopyMemory((PUCHAR)kmapped, buffer, chunk);
       status = STATUS_SUCCESS;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       status = STATUS_ACCESS_VIOLATION;
@@ -2007,11 +2063,14 @@ static NTSTATUS read_via_proxy_pte(PEPROCESS process, UINT64 va,
   }
 
   NTSTATUS status = STATUS_UNSUCCESSFUL;
+  // See write_via_proxy_pte: kmapped already has the page byte offset
+  // embedded (MmMapLockedPagesSpecifyCache preserves MDL->ByteOffset).
+  // Do NOT add offset_in_page — that would double-apply the offset.
   PVOID kmapped = MmMapLockedPagesSpecifyCache(
-      mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+      mdl, KernelMode, MmCached, NULL, FALSE, HighPagePriority);
   if (kmapped) {
     __try {
-      RtlCopyMemory(buffer, (PUCHAR)kmapped + offset_in_page, chunk);
+      RtlCopyMemory(buffer, (PUCHAR)kmapped, chunk);
       status = STATUS_SUCCESS;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       status = STATUS_ACCESS_VIOLATION;
@@ -2331,6 +2390,55 @@ PVOID g_ret_gadget_ntos = NULL;
 // discovery thread with the mutex held or immediately after teardown.
 static volatile UINT32 g_handoff_pid    = 0;   // cheat's Windows PID
 static volatile UINT64 g_handoff_ipc_va = 0;   // VA of IPC_MEMORY in cheat's AS
+
+// Forward declaration — ipc_worker_thread is defined below
+// (process_ipc_command_slot needs to report its VA in CMD_CAVE_STEP_* results).
+static VOID ipc_worker_thread(PVOID context);
+
+// ─── Cave step-debug state (CMD_CAVE_STEP_*) ────────────────────────────────
+// Auto-spoofing in DriverEntry is deferred so the driver always loads.  The
+// GUI walks the cave/KCFG/spawn pipeline one step at a time so we can isolate
+// which stage BSODs on baremetal (where we have no debug visibility).
+
+// Modules the SCAN step can probe.  Keep aligned with module_index in
+// IPC_CAVE_STEP_CMD.
+static const char* g_cave_step_modules[] = {
+    "ntoskrnl.exe",   // 0
+    "hal.dll",        // 1
+    "CI.dll",         // 2
+    "fltmgr.sys",     // 3
+};
+static constexpr UINT32 g_cave_step_module_count =
+    sizeof(g_cave_step_modules) / sizeof(g_cave_step_modules[0]);
+
+// Signals from the test thread back to CMD_CAVE_STEP_SPAWN.  Volatile +
+// Interlocked because the writer runs on a different thread than the reader.
+static volatile LONG g_cave_test_ran  = 0;   // 1 = test target was entered
+static volatile LONG g_cave_test_exit = 0;   // 1 = test target reached its RET
+
+//
+// cave_step_test_target — short-lived KSTART_ROUTINE used by CMD_CAVE_STEP_SPAWN.
+//
+// We deliberately do NOT redirect the cave's JMP to ipc_worker_thread for the
+// SPAWN test, because that would create an orphan worker that loops forever
+// (it doesn't observe g_ipc_thread_running until set by DriverEntry's normal
+// path).  Instead this target sets g_cave_test_ran, sleeps briefly so the
+// SPAWN handler can observe "alive" status, sets g_cave_test_exit, and
+// returns — letting PspSystemThreadStartup tear the thread down cleanly.
+//
+// If the BSOD reproduces during this thread's lifetime, the user knows it's
+// in the dispatch path (CET shadow stack, /GS cookie, alignment) and not in
+// the cave-write or KCFG-flip steps.
+//
+static VOID cave_step_test_target(PVOID context) {
+    UNREFERENCED_PARAMETER(context);
+    InterlockedExchange(&g_cave_test_ran, 1);
+    // 100 ms — long enough that the SPAWN handler's default 50 ms wait
+    // observes "alive", short enough that the thread is gone by next test.
+    LARGE_INTEGER delay; delay.QuadPart = -10000LL * 100;
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    InterlockedExchange(&g_cave_test_exit, 1);
+}
 
 static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
   PIPC_SLOT slot = &mem->slots[slot_idx];
@@ -2949,12 +3057,15 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     // ── General driver state ───────────────────────────────────────
     diag->worker_count    = IPC_WORKER_COUNT;
     diag->discovery_active = (g_discovery_thread != NULL) ? 1 : 0;
-    diag->target_attached  = (saved_process != NULL) ? 1 : 0;
-    diag->target_pid       = (UINT32)(saved_process ? g_cr3_cached_pid : 0);
+    // g_test_process is set by the discovery thread when a session is
+    // established and cleared on teardown. saved_process was a legacy
+    // alias that was never assigned — use g_test_process.
+    diag->target_attached  = (g_test_process != NULL) ? 1 : 0;
+    diag->target_pid       = (UINT32)(g_test_process ? g_cr3_cached_pid : 0);
     diag->target_cr3       = physical::m_stored_dtb;
-    if (saved_process) {
-      diag->target_base = (UINT64)(ULONG_PTR)SafePsGetProcessSectionBaseAddress(saved_process);
-      PUCHAR pname = SafePsGetProcessImageFileName(saved_process);
+    if (g_test_process) {
+      diag->target_base = (UINT64)(ULONG_PTR)SafePsGetProcessSectionBaseAddress(g_test_process);
+      PUCHAR pname = SafePsGetProcessImageFileName(g_test_process);
       if (pname) {
         SIZE_T n = 0;
         while (n < STEALTH_MAX_NAME_LEN - 1 && pname[n]) {
@@ -2971,7 +3082,9 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     IPC_RW_CYCLE_RESULT* rwResult = (IPC_RW_CYCLE_RESULT*)slot->data_buffer;
     RtlZeroMemory(rwResult, sizeof(IPC_RW_CYCLE_RESULT));
 
-    INT32 test_pid = (saved_process && g_cr3_cached_pid) ? g_cr3_cached_pid : 0;
+    // Use g_test_process (set by discovery thread on IPC attach).
+    // saved_process was never assigned and was always NULL.
+    INT32 test_pid = (g_test_process && g_cr3_cached_pid) ? g_cr3_cached_pid : 0;
     if (test_pid == 0) {
       rwResult->mode_used = 0xFF;
       final_status = STATUS_IPC_SUCCESS;
@@ -3130,6 +3243,422 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
 
     r->result = found ? 1 : 0;
     ExFreePool(pMods);
+    final_status = STATUS_IPC_SUCCESS;
+    break;
+  }
+
+  // ─── Cave step-debugging handlers ────────────────────────────────────
+  // Each handler does ONE stage of the spoofing pipeline and writes a fully
+  // populated IPC_CAVE_STEP_RESULT to slot->data_buffer.  Wrapped in __try
+  // so an SEH-able fault is captured as STATUS_IPC_ERROR rather than
+  // bugchecking — the bare-metal BSODs are the non-SEH kind (CET CP, /GS
+  // failure, etc.) which will still bring down the box, but the GUI will
+  // see WHICH step caused it because all earlier-step result blobs are
+  // already in the slot buffer when the next step is invoked.
+
+  case CMD_CAVE_STEP_SCAN: {
+    PIPC_CAVE_STEP_RESULT r =
+        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
+    RtlZeroMemory(r, sizeof(*r));
+    r->step_id = CMD_CAVE_STEP_SCAN;
+    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
+
+    UINT32 idx = slot->cmd_data.cave_step.module_index;
+    if (idx >= g_cave_step_module_count) {
+      r->ntstatus = (UINT32)STATUS_INVALID_PARAMETER;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+    const char* modName = g_cave_step_modules[idx];
+    SIZE_T mlen = 0; while (modName[mlen] && mlen < 31) mlen++;
+    RtlCopyMemory(r->scan_module_name, modName, mlen);
+    r->scan_module_name[mlen] = '\0';
+
+    extern CODE_CAVE g_thread_cave;
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    __try {
+      st = CodeCave::FindCodeCave(modName, &g_thread_cave);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      st = (NTSTATUS)GetExceptionCode();
+      RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+    }
+    r->ntstatus = (UINT32)st;
+    if (NT_SUCCESS(st) && g_thread_cave.is_valid) {
+      // Stamp module_name into cave for downstream commands.
+      SIZE_T mn = 0; while (modName[mn] && mn < 63) {
+        g_thread_cave.module_name[mn] = modName[mn]; mn++;
+      }
+      g_thread_cave.module_name[mn] = '\0';
+
+      r->scan_module_base   = (UINT64)(ULONG_PTR)g_thread_cave.module_base;
+      PVOID textVA = nullptr; SIZE_T textSz = 0;
+      __try {
+        CodeCave::GetTextSectionRange(g_thread_cave.module_base, &textVA, &textSz);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      r->scan_text_start    = (UINT64)(ULONG_PTR)textVA;
+      r->scan_text_size     = (UINT64)textSz;
+      r->scan_cave_address  = (UINT64)(ULONG_PTR)g_thread_cave.cave_address;
+      r->scan_cave_size     = (UINT64)g_thread_cave.cave_size;
+      r->scan_aligned       = (((ULONG_PTR)g_thread_cave.cave_address & 0xF) == 0) ? 1u : 0u;
+      final_status = STATUS_IPC_SUCCESS;
+    } else {
+      final_status = STATUS_IPC_ERROR;
+    }
+    break;
+  }
+
+  case CMD_CAVE_STEP_PATCH: {
+    PIPC_CAVE_STEP_RESULT r =
+        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
+    RtlZeroMemory(r, sizeof(*r));
+    r->step_id = CMD_CAVE_STEP_PATCH;
+    // Patch target = cave_step_test_target.  Production auto-init (when
+    // re-enabled) uses ipc_worker_thread instead; the step-debug pipeline
+    // uses the short-lived test target so SPAWN doesn't orphan workers.
+    PVOID target = (PVOID)&cave_step_test_target;
+    r->worker_function_va = (UINT64)(ULONG_PTR)target;
+
+    extern CODE_CAVE g_thread_cave;
+    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
+      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+
+    // Snapshot current bytes (for the "before" picture) into r->patch_bytes
+    // temporarily — overwritten by the post-patch read below.
+    SIZE_T copyN = (g_thread_cave.cave_size < 18) ?
+                   g_thread_cave.cave_size : 18;
+    __try {
+      RtlCopyMemory(r->patch_bytes, g_thread_cave.cave_address, copyN);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    __try {
+      st = CodeCave::PatchCaveWithJump(&g_thread_cave, target);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      st = (NTSTATUS)GetExceptionCode();
+    }
+    r->ntstatus = (UINT32)st;
+    if (NT_SUCCESS(st)) {
+      // Recompute disp / variant — mirror the logic in PatchCaveWithJump
+      // so the user sees what was actually applied.
+      ULONG_PTR caveVa = (ULONG_PTR)g_thread_cave.cave_address;
+      ULONG_PTR jmpVa  = caveVa + 4;
+      ULONG_PTR tgtVa  = (ULONG_PTR)target;
+      INT64 disp64 = (INT64)(tgtVa - (jmpVa + 5));
+      r->patch_disp = disp64;
+      if (disp64 >= (INT64)INT32_MIN && disp64 <= (INT64)INT32_MAX) {
+        r->patch_used_rel32 = 1;
+        r->patch_size = 9;
+      } else {
+        r->patch_used_rel32 = 0;
+        r->patch_size = 18;
+      }
+      __try {
+        RtlCopyMemory(r->patch_bytes, g_thread_cave.cave_address, r->patch_size);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      final_status = STATUS_IPC_SUCCESS;
+    } else {
+      final_status = STATUS_IPC_ERROR;
+    }
+    break;
+  }
+
+  case CMD_CAVE_STEP_KCFG_RESOLVE: {
+    PIPC_CAVE_STEP_RESULT r =
+        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
+    RtlZeroMemory(r, sizeof(*r));
+    r->step_id = CMD_CAVE_STEP_KCFG_RESOLVE;
+    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
+
+    // Reset the one-shot cache so re-tries after a driver fix pick up
+    // the new code path (Load Config lookup, etc.).
+    KcfgPatch::ResetResolveCache();
+
+    KcfgPatch::CFG_RESOLVE info = {};
+    __try {
+      info = KcfgPatch::Resolve();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      r->ntstatus = (UINT32)GetExceptionCode();
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+    r->kcfg_fptr_loc         = (UINT64)(ULONG_PTR)info.fptr_loc;
+    r->kcfg_fptr_value       = (UINT64)(ULONG_PTR)info.fptr_value;
+    r->kcfg_nop_func         = (UINT64)(ULONG_PTR)info.nop_func;
+    r->kcfg_active           = info.kcfg_active ? 1u : 0u;
+    r->kcfg_bitmap_base_loc  = (UINT64)(ULONG_PTR)info.bitmap_base_loc;
+    r->kcfg_bitmap_base      = (UINT64)(ULONG_PTR)info.bitmap_base;
+
+    // Dump the dispatch function prologue (first 16 bytes) for diagnostics.
+    if (info.fptr_value && MmIsAddressValid(info.fptr_value)) {
+      __try {
+        RtlCopyMemory(r->kcfg_dispatch_prologue, info.fptr_value, 16);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    if (!info.valid) {
+      r->kcfg_layout_valid = 0;
+      r->ntstatus = (UINT32)STATUS_NOT_FOUND;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+
+    // Probe known-valid exports and read their bitmap bits.
+    static const char* probes[4] = {
+      "PsCreateSystemThread",
+      "ExAllocatePool2",
+      "KeQueryActiveProcessorCountEx",
+      "MmGetSystemRoutineAddress",
+    };
+    PVOID ntos = GetSystemModuleBase("ntoskrnl.exe");
+
+    if (!info.kcfg_active) {
+      // CFG is inactive (NOP stub, bitmap NULL, or debugger attached).
+      // Probing the bitmap is meaningless — fill names/addrs for display
+      // but mark bits as "not checked" (0xFE).
+      for (int p = 0; p < 4; p++) {
+        SIZE_T nn = 0; while (probes[p][nn] && nn < 23) {
+          r->kcfg_probe_names[p][nn] = probes[p][nn]; nn++;
+        }
+        r->kcfg_probe_names[p][nn] = '\0';
+        PVOID exp = ntos ? KcfgPatch::FindExport(ntos, probes[p]) : nullptr;
+        r->kcfg_probe_addrs[p] = (UINT64)(ULONG_PTR)exp;
+        r->kcfg_probe_bits[p] = 0xFE;  // "not checked — CFG inactive"
+      }
+      r->kcfg_layout_valid = 2;  // 2 = N/A (CFG inactive, no bitmap)
+      r->ntstatus = (UINT32)STATUS_SUCCESS;
+      final_status = STATUS_IPC_SUCCESS;
+      break;
+    }
+
+    // CFG IS active — probe the bitmap for known-valid exports.
+    BOOLEAN anySet = FALSE;
+    for (int p = 0; p < 4; p++) {
+      SIZE_T nn = 0; while (probes[p][nn] && nn < 23) {
+        r->kcfg_probe_names[p][nn] = probes[p][nn]; nn++;
+      }
+      r->kcfg_probe_names[p][nn] = '\0';
+
+      PVOID exp = ntos ? KcfgPatch::FindExport(ntos, probes[p]) : nullptr;
+      r->kcfg_probe_addrs[p] = (UINT64)(ULONG_PTR)exp;
+      if (!exp || !info.bitmap_base) {
+        r->kcfg_probe_bits[p] = 0xFF;
+        continue;
+      }
+      __try {
+        int b = KcfgPatch::ReadBit(info.bitmap_base, (ULONG_PTR)exp);
+        r->kcfg_probe_bits[p] = (b < 0) ? 0xFF : (UINT8)b;
+        if (b == 1) anySet = TRUE;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        r->kcfg_probe_bits[p] = 0xFF;
+      }
+    }
+    r->kcfg_layout_valid = anySet ? 1u : 0u;
+    r->ntstatus = (UINT32)STATUS_SUCCESS;
+    final_status = STATUS_IPC_SUCCESS;
+    break;
+  }
+
+  case CMD_CAVE_STEP_KCFG_PATCH: {
+    PIPC_CAVE_STEP_RESULT r =
+        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
+    RtlZeroMemory(r, sizeof(*r));
+    r->step_id = CMD_CAVE_STEP_KCFG_PATCH;
+    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
+
+    extern CODE_CAVE g_thread_cave;
+    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
+      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+    r->kcfg_target_addr = (UINT64)(ULONG_PTR)g_thread_cave.cave_address;
+
+    // Read byte_before
+    KcfgPatch::CFG_RESOLVE info = KcfgPatch::Resolve();
+    if (info.valid && info.bitmap_base) {
+      ULONG_PTR bo; ULONG bb;
+      KcfgPatch::ComputeBitPos((ULONG_PTR)g_thread_cave.cave_address, &bo, &bb);
+      r->kcfg_byte_offset = (UINT64)bo;
+      r->kcfg_bit_in_byte = bb;
+      PUCHAR ba = (PUCHAR)info.bitmap_base + bo;
+      r->kcfg_byte_addr = (UINT64)(ULONG_PTR)ba;
+      __try {
+        if (MmIsAddressValid(ba)) r->kcfg_byte_before = *ba;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    __try {
+      st = KcfgPatch::MarkValidCallTarget(g_thread_cave.cave_address);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      st = (NTSTATUS)GetExceptionCode();
+    }
+    r->ntstatus = (UINT32)st;
+
+    // Read byte_after
+    if (info.valid && info.bitmap_base && r->kcfg_byte_addr) {
+      __try {
+        if (MmIsAddressValid((PVOID)(ULONG_PTR)r->kcfg_byte_addr))
+          r->kcfg_byte_after = *(PUCHAR)(ULONG_PTR)r->kcfg_byte_addr;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    final_status = NT_SUCCESS(st) ? STATUS_IPC_SUCCESS : STATUS_IPC_ERROR;
+    break;
+  }
+
+  case CMD_CAVE_STEP_SPAWN: {
+    PIPC_CAVE_STEP_RESULT r =
+        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
+    RtlZeroMemory(r, sizeof(*r));
+    r->step_id = CMD_CAVE_STEP_SPAWN;
+    r->worker_function_va = (UINT64)(ULONG_PTR)&cave_step_test_target;
+
+    extern CODE_CAVE g_thread_cave;
+    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
+      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+
+    // ─── Pre-flight: verify the cave still contains our patch ──────────
+    // Guards against PatchGuard/CI reverting the bytes between PATCH and
+    // SPAWN steps, and confirms the embedded target address is correct.
+    PUCHAR caveBytes = (PUCHAR)g_thread_cave.cave_address;
+    __try {
+      RtlCopyMemory(r->spawn_cave_verify, caveBytes, 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (caveBytes[0] != 0xF3 || caveBytes[1] != 0x0F ||
+        caveBytes[2] != 0x1E || caveBytes[3] != 0xFA) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] SPAWN: cave ENDBR64 missing — patch reverted?\n");
+      r->ntstatus = (UINT32)STATUS_INVALID_IMAGE_FORMAT;
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+
+    // For abs64 form (FF 25 00 00 00 00 + 8-byte target), verify the
+    // embedded target matches cave_step_test_target.
+    if (caveBytes[4] == 0xFF && caveBytes[5] == 0x25) {
+      ULONG_PTR embeddedTarget = 0;
+      __try {
+        RtlCopyMemory(&embeddedTarget, &caveBytes[10], sizeof(ULONG_PTR));
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      r->spawn_embedded_target = (UINT64)embeddedTarget;
+      if (embeddedTarget != (ULONG_PTR)&cave_step_test_target) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] SPAWN: embedded target %p != test_target %p\n",
+                   (PVOID)embeddedTarget, &cave_step_test_target);
+        r->ntstatus = (UINT32)STATUS_INVALID_ADDRESS;
+        final_status = STATUS_IPC_ERROR;
+        break;
+      }
+    } else if (caveBytes[4] == 0xE9) {
+      // rel32 form — compute effective target for diagnostics.
+      INT32 disp = 0;
+      __try { RtlCopyMemory(&disp, &caveBytes[5], 4); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      ULONG_PTR effectiveTarget = (ULONG_PTR)caveBytes + 4 + 5 + (INT64)disp;
+      r->spawn_embedded_target = (UINT64)effectiveTarget;
+      if (effectiveTarget != (ULONG_PTR)&cave_step_test_target) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] SPAWN: rel32 target %p != test_target %p\n",
+                   (PVOID)effectiveTarget, &cave_step_test_target);
+        r->ntstatus = (UINT32)STATUS_INVALID_ADDRESS;
+        final_status = STATUS_IPC_ERROR;
+        break;
+      }
+    }
+
+    InterlockedExchange(&g_cave_test_ran, 0);
+    InterlockedExchange(&g_cave_test_exit, 0);
+
+    DbgPrintEx(0x4d, 0xffffffff,
+               "[CR3-IPC] SPAWN: creating thread — cave=%p target=%p\n",
+               g_thread_cave.cave_address, &cave_step_test_target);
+
+    HANDLE hT = NULL;
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
+    __try {
+      st = PsCreateSystemThread(
+          &hT, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+          (PKSTART_ROUTINE)g_thread_cave.cave_address,
+          NULL);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      st = (NTSTATUS)GetExceptionCode();
+    }
+    r->spawn_create_status = (UINT32)st;
+    r->ntstatus = (UINT32)st;
+
+    if (!NT_SUCCESS(st)) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] SPAWN: PsCreateSystemThread failed 0x%X\n", st);
+      final_status = STATUS_IPC_ERROR;
+      break;
+    }
+
+    r->spawn_thread_handle = (UINT64)(ULONG_PTR)hT;
+    PETHREAD pT = NULL;
+    __try {
+      if (NT_SUCCESS(ObReferenceObjectByHandle(
+              hT, THREAD_ALL_ACCESS, NULL, KernelMode,
+              (PVOID*)&pT, NULL))) {
+        r->spawn_thread_object = (UINT64)(ULONG_PTR)pT;
+      }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    // Wait for the test thread to run.  Use at least 200 ms — 50 ms is
+    // too short on systems with many CPUs or high load; the thread may
+    // not have been scheduled yet.
+    UINT32 waitMs = slot->cmd_data.cave_step.spawn_wait_ms;
+    if (waitMs == 0) waitMs = 200;
+    if (waitMs > 5000) waitMs = 5000;
+    LARGE_INTEGER delay; delay.QuadPart = -10000LL * (LONGLONG)waitMs;
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+    // Check if the thread has already terminated (crashed or returned).
+    BOOLEAN threadTerminated = FALSE;
+    if (pT) {
+      LARGE_INTEGER zeroTimeout; zeroTimeout.QuadPart = 0;
+      NTSTATUS waitSt = KeWaitForSingleObject(
+          pT, Executive, KernelMode, FALSE, &zeroTimeout);
+      threadTerminated = (waitSt == STATUS_SUCCESS);
+    }
+
+    LONG testRan  = InterlockedCompareExchange(&g_cave_test_ran, 0, 0);
+    LONG testExit = InterlockedCompareExchange(&g_cave_test_exit, 0, 0);
+
+    r->spawn_test_ran = (UINT32)testRan;
+
+    if (threadTerminated && testRan == 0) {
+      // Thread terminated but never reached cave_step_test_target's
+      // first line.  The JMP dispatch itself crashed (CFG, CET, bad
+      // address, or an access violation in the trampoline).
+      r->spawn_alive = 0;
+      r->spawn_exit_status = 0xDEAD0001; // sentinel: dispatch crash
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] SPAWN: thread CRASHED before reaching test target "
+                 "(terminated=%d, ran=%d, exit=%d)\n",
+                 threadTerminated, testRan, testExit);
+    } else if (threadTerminated && testRan == 1) {
+      // Thread ran AND exited cleanly.  This is success.
+      r->spawn_alive = 0;
+      r->spawn_exit_status = 0;
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] SPAWN: thread ran and exited cleanly\n");
+    } else {
+      // Thread still alive (hasn't terminated yet).
+      r->spawn_alive = 1;
+      r->spawn_exit_status = 0;
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] SPAWN: thread alive — ran=%d exit=%d\n",
+                 testRan, testExit);
+    }
+
+    if (pT) ObDereferenceObject(pT);
+    ZwClose(hT);
     final_status = STATUS_IPC_SUCCESS;
     break;
   }
@@ -4056,15 +4585,54 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     }
   }
 
-  // ── Code cave thread-spoofing ──────────────────────────────────────
-  // PatchCaveWithJump uses CR0.WP toggle (not MmMapIoSpaceEx) and gates
-  // on IsHvciActive(), so it is safe to run unconditionally.
+  // ── Code cave thread-spoofing — AUTO-ENABLED ───────────────────────
+  // Auto-spoofing is now enabled at DriverEntry. The code cave is found,
+  // patched, and KCFG bitmap is updated automatically. If any step fails,
+  // the driver gracefully falls back to non-spoofed thread creation.
+  //
+  // The pipeline executes:
+  //   1. Find a cave in ntoskrnl.exe (or fallback modules)
+  //   2. Apply the ENDBR64+JMP patch
+  //   3. Mark the cave address as a valid CFG call target
+  //
+  // If spoofing succeeds, worker threads will use the cave address as their
+  // start routine, making ETHREAD.Win32StartAddress point into legitimate
+  // kernel module .text instead of unbacked memory.
+  //
+  // ── Auto-spoofing block (ENABLED) ───────────────────────────────────
+  RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   __try {
-    CodeCave::FindAndPatchAnyCave((PVOID)ipc_worker_thread, &g_thread_cave);
+    NTSTATUS cave_st = CodeCave::FindAndPatchAnyCave((PVOID)ipc_worker_thread, &g_thread_cave);
+    if (NT_SUCCESS(cave_st) && g_thread_cave.is_valid && g_thread_cave.cave_address) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CodeCave: SUCCESS — found and patched cave at %p "
+                 "(module: %p, size: %zu)\n",
+                 g_thread_cave.cave_address, g_thread_cave.module_base, g_thread_cave.cave_size);
+      
+      // Mark the cave address as a valid CFG call target
+      __try {
+        KcfgPatch::MarkValidCallTarget(g_thread_cave.cave_address);
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CodeCave: KCFG bitmap updated for cave address %p\n",
+                   g_thread_cave.cave_address);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CodeCave: KCFG patch raised exception 0x%X — "
+                   "cave may not be CFG-valid, zeroing g_thread_cave\n",
+                   GetExceptionCode());
+        RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+      }
+    } else {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CodeCave: FindAndPatchAnyCave failed (st=0x%X) — "
+                 "falling back to non-spoofed thread creation\n", cave_st);
+      RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+    }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     DbgPrintEx(0x4d, 0xffffffff,
-               "[CR3-IPC] CodeCave: discovery/patch raised exception 0x%X — "
-               "thread spoofing disabled\n", GetExceptionCode());
+               "[CR3-IPC] CodeCave: FindAndPatchAnyCave raised exception 0x%X — "
+               "falling back to non-spoofed thread creation\n",
+               GetExceptionCode());
     RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   }
 

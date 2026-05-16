@@ -119,6 +119,7 @@
     <ClInclude Include="hwid_spoofer.hpp" />
     <ClInclude Include="imports.h" />
     <ClInclude Include="ipc_config.h" />
+    <ClInclude Include="kcfg_patch.h" />
     <ClInclude Include="mouse.hpp" />
     <ClInclude Include="shared_memory_ipc.h" />
     <ClInclude Include="syscall_stack_spoof.h" />
