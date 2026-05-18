@@ -7,6 +7,13 @@ namespace physical {
   inline PTE_NEW* main_page_entry;
   inline void* main_virtual_address;
 
+  // Serializes proxy-PTE swaps across all cores. Without this lock, two
+  // threads on different cores could race the PTE write + local INVLPG and
+  // read/write through a stale TLB mapping — corrupting random physical
+  // memory (often a page table itself, producing a hard hang with no BSOD).
+  inline KSPIN_LOCK main_page_lock;
+  inline bool main_page_lock_initialized = false;
+
   void* physical_to_virtual(const uintptr_t address) {
     PHYSICAL_ADDRESS physical{};
     physical.QuadPart = address;
@@ -58,34 +65,47 @@ namespace physical {
 
     main_page_entry = pte;
 
+    KeInitializeSpinLock(&main_page_lock);
+    main_page_lock_initialized = true;
+
     return STATUS_SUCCESS;
   }
 
+  // Swaps the proxy PTE to point at `physical_address` and returns the proxy
+  // VA (with sub-page offset applied).  Caller MUST hold the proxy spinlock
+  // at DISPATCH_LEVEL across the access — use acquire_proxy/release_proxy.
+  //
+  // The previous implementation issued a system-wide TLB shootdown and a
+  // global WBINVD on EVERY swap.  For a typical DLL injection that codepath
+  // performs hundreds of swaps; the resulting IPI / wbinvd storm starves the
+  // DPC watchdog and produces a hard hang (no BSOD UI is rendered in time
+  // — user observes a frozen machine that needs a force restart).
+  //
+  // A PTE rewrite on writeback memory does NOT require cache invalidation:
+  // x86 cache coherency handles writes-through to RAM automatically.  The
+  // only requirement is a local TLB invalidate, which is safe because the
+  // surrounding acquire_proxy() raises IRQL to DISPATCH_LEVEL, pinning the
+  // thread to this CPU until release.
   PVOID overwrite_page(const uintptr_t physical_address) {
-    // page boundary checks are done by Read/WriteProcessMemory
-    // and page entries are not spread over different pages
     const unsigned long page_offset = physical_address % PAGE_SIZE;
     const uintptr_t page_start_physical = physical_address - page_offset;
     main_page_entry->PageFrame = PAGE_TO_PFN(page_start_physical);
-
     _mm_mfence();
-
-    // Guard each pattern-scanned function: if the scan failed for this build
-    // the pointer is null and a blind call would BSOD with PAGE_FAULT_IN_NONPAGED_AREA.
-    if (globals::ke_flush_entire_tb)
-        globals::ke_flush_entire_tb(TRUE, TRUE);
-
-    if (globals::ke_invalidate_all_caches)
-        globals::ke_invalidate_all_caches();
-    else
-        intrin::wbinvd();
-
-    if (globals::ke_flush_single_tb)
-        globals::ke_flush_single_tb(reinterpret_cast<uintptr_t>(main_virtual_address), 0, 1);
-    else
-        intrin::invlpg(main_virtual_address);
-
+    intrin::invlpg(main_virtual_address);
     return reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(main_virtual_address) + page_offset);
+  }
+
+  // Acquire serialized access to the proxy page.  Raises IRQL to DISPATCH
+  // (pins thread to this CPU) so the local INVLPG in overwrite_page is
+  // sufficient and no IPIs are needed.
+  static __forceinline KIRQL acquire_proxy() {
+    KIRQL old;
+    KeAcquireSpinLock(&main_page_lock, &old);
+    return old;
+  }
+
+  static __forceinline void release_proxy(KIRQL old) {
+    KeReleaseSpinLock(&main_page_lock, old);
   }
 
   NTSTATUS read_physical_address(const uintptr_t target_address, void* buffer, const size_t size,
@@ -96,7 +116,7 @@ namespace physical {
       return STATUS_UNSUCCESSFUL;
     }
 
-    if (!main_page_entry || !main_virtual_address) {
+    if (!main_page_entry || !main_virtual_address || !main_page_lock_initialized) {
       log("ERROR", "physical::init() was not called or failed — proxy PTE unavailable");
       return STATUS_UNSUCCESSFUL;
     }
@@ -105,16 +125,21 @@ namespace physical {
       log("ERROR", "invalid physical address: 0x%llx", target_address);
       return STATUS_UNSUCCESSFUL;
     }
+
+    // The PTE swap + memcpy must happen as one atomic window on this CPU.
+    // acquire_proxy() takes the spinlock (raises IRQL to DISPATCH, pinning
+    // us to this core), so the local INVLPG inside overwrite_page is the
+    // only TLB flush we need.
+    KIRQL old = acquire_proxy();
     const auto virtual_address = overwrite_page(target_address);
     if (!validation::is_virtual_address_valid(virtual_address) && !bypass_validation) {
+      release_proxy(old);
       log("ERROR", "invalid virtual address after overwrite_page: 0x%llx (physical: 0x%llx)",
           virtual_address, target_address);
       return STATUS_UNSUCCESSFUL;
     }
     globals::memcpy(buffer, virtual_address, size);
-    // log("SUCCESS", "read 0x%llx bytes from physical 0x%llx (virtual: 0x%llx)", size,
-    // target_address,
-    //     virtual_address);
+    release_proxy(old);
     return STATUS_SUCCESS;
   }
 
@@ -126,18 +151,26 @@ namespace physical {
       return STATUS_UNSUCCESSFUL;
     }
 
+    if (!main_page_entry || !main_virtual_address || !main_page_lock_initialized) {
+      log("ERROR", "physical::init() was not called or failed — proxy PTE unavailable");
+      return STATUS_UNSUCCESSFUL;
+    }
+
     if (!validation::is_physical_address_valid(target_address) && !bypass_validation) {
       log("ERROR", "invalid physical address: 0x%llx", target_address);
       return STATUS_UNSUCCESSFUL;
     }
+
+    KIRQL old = acquire_proxy();
     const auto virtual_address = overwrite_page(target_address);
     if (!validation::is_virtual_address_valid(virtual_address) && !bypass_validation) {
+      release_proxy(old);
       log("ERROR", "invalid virtual address after overwrite_page: 0x%llx (physical: 0x%llx)",
           virtual_address, target_address);
       return STATUS_UNSUCCESSFUL;
     }
-
     globals::memcpy(virtual_address, buffer, size);
+    release_proxy(old);
 
     return STATUS_SUCCESS;
   }
@@ -153,13 +186,15 @@ namespace physical {
     const uintptr_t pd = ((virtual_address >> 30) & (0x1ffll));
     const uintptr_t pdp = ((virtual_address >> 39) & (0x1ffll));
 
+    // Page table entries are always valid physical addresses (EPROCESS.DirectoryTableBase
+    // and all subsequent entries are CPU-trusted structures), so bypass range validation.
     uintptr_t pdpe = 0;
-    read_physical_address(directory_table_base + 8 * pdp, &pdpe, sizeof(pdpe));
+    read_physical_address(directory_table_base + 8 * pdp, &pdpe, sizeof(pdpe), true);
     if (~pdpe & 1)
       return 0;
 
     uintptr_t pde = 0;
-    read_physical_address((pdpe & PMASK) + 8 * pd, &pde, sizeof(pde));
+    read_physical_address((pdpe & PMASK) + 8 * pd, &pde, sizeof(pde), true);
     if (~pde & 1)
       return 0;
 
@@ -168,7 +203,7 @@ namespace physical {
       return (pde & (~0ull << 42 >> 12)) + (virtual_address & ~(~0ull << 30));
 
     uintptr_t pte_addr = 0;
-    read_physical_address((pde & PMASK) + 8 * pt, &pte_addr, sizeof(pte_addr));
+    read_physical_address((pde & PMASK) + 8 * pt, &pte_addr, sizeof(pte_addr), true);
     if (~pte_addr & 1)
       return 0;
 
@@ -177,7 +212,7 @@ namespace physical {
       return (pte_addr & PMASK) + (virtual_address & ~(~0ull << 21));
 
     uintptr_t result_address = 0;
-    read_physical_address((pte_addr & PMASK) + 8 * pte, &result_address, sizeof(result_address));
+    read_physical_address((pte_addr & PMASK) + 8 * pte, &result_address, sizeof(result_address), true);
     result_address &= PMASK;
 
     if (!result_address)

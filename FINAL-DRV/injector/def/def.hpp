@@ -1,6 +1,11 @@
 #pragma once
 
-#define ENABLE_DEBUG_PRINT 1
+// TEMPORARILY DISABLED while chasing the 0xF7 BSOD.  The injector log() macro
+// fires hundreds of times per inject (every PT entry, every RAII acquire);
+// any one of those with a stale %p / %s would produce the page-fault-in-
+// DbgPrint pattern we keep seeing in the dump.  Re-enable once the BSOD is
+// rooted out.
+#define ENABLE_DEBUG_PRINT 0
 
 #if ENABLE_DEBUG_PRINT
   #define log(level, format, ...) \
@@ -674,6 +679,13 @@ namespace function_types {
   using zw_wait_for_single_object_t = NTSTATUS(__stdcall*)(HANDLE handle, BOOLEAN alertable,
                                                            PLARGE_INTEGER timeout);
 
+  // ZwResumeThread — handle-based.  Reliably exported on every modern
+  // Windows kernel (PsResumeThread is undocumented and not always present).
+  // Decrements the thread's suspend count and resumes execution when it
+  // reaches 0.
+  using zw_resume_thread_t = NTSTATUS(__stdcall*)(HANDLE thread_handle,
+                                                  PULONG previous_suspend_count);
+
   using zw_query_information_process_t = NTSTATUS(__fastcall*)(
       _In_ HANDLE ProcessHandle, _In_ PROCESSINFOCLASS ProcessInformationClass,
       _Out_ PVOID ProcessInformation, _In_ ULONG ProcessInformationLength,
@@ -681,6 +693,20 @@ namespace function_types {
 
   using nt_alert_resume_thread_t = NTSTATUS(__fastcall*)(HANDLE thread_handle,
                                                          PULONG suspend_count);
+
+  // NtCreateThreadEx — the supported kernel-mode entry point for cross-process
+  // thread creation.  RtlCreateUserThread is NOT exported by ntoskrnl on most
+  // Windows builds (it lives in ntdll.dll), so MmGetSystemRoutineAddress
+  // returns NULL for it and calling that NULL pointer is what was producing
+  // the DRIVER_OVERRAN_STACK_BUFFER 0xF7 on inject.  NtCreateThreadEx IS in
+  // ntoskrnl's export table and is callable from kernel context once we are
+  // attached to the target via KeStackAttachProcess.
+  using nt_create_thread_ex_t = NTSTATUS(__stdcall*)(
+      PHANDLE thread_handle, ACCESS_MASK desired_access,
+      POBJECT_ATTRIBUTES object_attributes, HANDLE process_handle,
+      PVOID start_routine, PVOID argument, ULONG create_flags,
+      SIZE_T zero_bits, SIZE_T stack_size, SIZE_T maximum_stack_size,
+      PVOID attribute_list);
 
   // debug
   using dbg_print_t = ULONG(__cdecl*)(PCCH format, ...);

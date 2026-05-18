@@ -96,6 +96,261 @@ static PVOID inj_resolve(const wchar_t* name) {
     return MmGetSystemRoutineAddress(&us);
 }
 
+// Scan one named PE section (e.g. ".text", "PAGE", "PAGELK") for `pat_str`.
+// Returns a pointer to the first matching byte, or nullptr.  Modeled after
+// kdmapper's FindPatternInSectionAtKernel — required because some functions
+// (MmFreeIndependentPages, MmSetPageProtection, PiDDB*) live in non-`.text`
+// sections and a global pattern scan can false-match equivalent prologues in
+// unrelated sections.
+static PVOID inj_scan_pattern_in_section(PVOID ntos_base,
+                                         const char* section_name,
+                                         const char* pat_str) {
+    if (!ntos_base || !section_name || !pat_str) return nullptr;
+
+    // Parse pattern (same parser as inj_scan_pattern above).
+    UINT8  pat[256]  = {};
+    bool   mask[256] = {};
+    SIZE_T plen      = 0;
+    for (const char* p = pat_str; *p && plen < 256;) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        if (*p == '?') {
+            mask[plen] = false; pat[plen] = 0; ++plen; ++p;
+            if (*p == '?') ++p;
+        } else {
+            UINT8 b = 0;
+            for (int n = 0; n < 2 && *p && *p != ' ' && *p != '?'; ++n, ++p) {
+                b = (UINT8)(b << 4);
+                if      (*p >= '0' && *p <= '9') b |= (UINT8)(*p - '0');
+                else if (*p >= 'A' && *p <= 'F') b |= (UINT8)(*p - 'A' + 10);
+                else if (*p >= 'a' && *p <= 'f') b |= (UINT8)(*p - 'a' + 10);
+            }
+            pat[plen] = b; mask[plen] = true; ++plen;
+        }
+    }
+    if (!plen) return nullptr;
+
+    auto* dos = (PIMAGE_DOS_HEADER)ntos_base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = (PIMAGE_NT_HEADERS64)((UINT8*)ntos_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    // Section names in the PE header are not null-terminated when full.
+    // Compare up to IMAGE_SIZEOF_SHORT_NAME (8) bytes.
+    auto name_eq = [](const char* a, const char* b) -> bool {
+        for (int i = 0; i < IMAGE_SIZEOF_SHORT_NAME; ++i) {
+            char ca = a[i], cb = b[i];
+            if (ca != cb) return false;
+            if (ca == '\0') return true;
+        }
+        return true;
+    };
+
+    auto* secs = IMAGE_FIRST_SECTION(nt);
+    for (USHORT si = 0; si < nt->FileHeader.NumberOfSections; ++si) {
+        if (!name_eq((const char*)secs[si].Name, section_name)) continue;
+        auto*  base = (UINT8*)ntos_base + secs[si].VirtualAddress;
+        SIZE_T size = secs[si].Misc.VirtualSize;
+        if (size < plen) continue;
+        for (SIZE_T i = 0; i + plen <= size; ++i) {
+            bool found = true;
+            for (SIZE_T j = 0; j < plen; ++j) {
+                if (mask[j] && base[i + j] != pat[j]) { found = false; break; }
+            }
+            if (found) return base + i;
+        }
+    }
+    return nullptr;
+}
+
+// Manual export-table walker.  Some KDU-mapped images can't reliably reach
+// MmGetSystemRoutineAddress (or it returns NULL for routines that are in
+// fact exported).  This function walks ntoskrnl's IMAGE_EXPORT_DIRECTORY by
+// hand, exactly the way kdmapper's GetKernelModuleExport does it, and is
+// independent of any kernel-API resolve.  Returns nullptr if the name isn't
+// present or resolves to a forwarder.
+static PVOID inj_get_export(PVOID module_base, const char* name) {
+    if (!module_base || !name) return nullptr;
+    auto* dos = (PIMAGE_DOS_HEADER)module_base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = (PIMAGE_NT_HEADERS64)((UINT8*)module_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    ULONG exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    ULONG exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!exp_rva || !exp_size) return nullptr;
+
+    auto* exp   = (PIMAGE_EXPORT_DIRECTORY)((UINT8*)module_base + exp_rva);
+    auto* names = (ULONG*)  ((UINT8*)module_base + exp->AddressOfNames);
+    auto* ords  = (USHORT*) ((UINT8*)module_base + exp->AddressOfNameOrdinals);
+    auto* funcs = (ULONG*)  ((UINT8*)module_base + exp->AddressOfFunctions);
+
+    for (ULONG i = 0; i < exp->NumberOfNames; ++i) {
+        const char* fn_name = (const char*)((UINT8*)module_base + names[i]);
+        // Inline strcmp — we can't depend on globals::strncmp here, it may
+        // not be resolved yet.
+        bool match = true;
+        for (ULONG j = 0; ; ++j) {
+            char a = fn_name[j];
+            char b = name[j];
+            if (a != b) { match = false; break; }
+            if (a == '\0') break;
+        }
+        if (!match) continue;
+
+        USHORT ord = ords[i];
+        if (ord >= exp->NumberOfFunctions) return nullptr;
+        ULONG fn_rva = funcs[ord];
+        if (!fn_rva) return nullptr;
+        // Forwarded exports point into the export directory itself; we don't
+        // try to follow forwarders.  Return nullptr so the caller can fall
+        // back to pattern scan.
+        if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_size) return nullptr;
+        return (PVOID)((UINT8*)module_base + fn_rva);
+    }
+    return nullptr;
+}
+
+// Scan a section iteratively, yielding every match.  Calls `cb(hit, ctx)` for
+// each.  Stops when the callback returns true (match accepted).  Returns the
+// accepted hit, or nullptr.  Used to find NtCreateThreadEx by walking every
+// generic-looking syscall prologue and validating each via a follow-up scan
+// for the `mov rax, gs:[0x188]` syscall self-pointer load.
+static PVOID inj_scan_pattern_in_section_iter(
+    PVOID ntos_base, const char* section_name, const char* pat_str,
+    bool (*accept)(UINT8* hit, SIZE_T remaining, void* ctx), void* ctx) {
+    if (!ntos_base || !section_name || !pat_str || !accept) return nullptr;
+
+    UINT8  pat[256]  = {};
+    bool   mask[256] = {};
+    SIZE_T plen      = 0;
+    for (const char* p = pat_str; *p && plen < 256;) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        if (*p == '?') {
+            mask[plen] = false; pat[plen] = 0; ++plen; ++p;
+            if (*p == '?') ++p;
+        } else {
+            UINT8 b = 0;
+            for (int n = 0; n < 2 && *p && *p != ' ' && *p != '?'; ++n, ++p) {
+                b = (UINT8)(b << 4);
+                if      (*p >= '0' && *p <= '9') b |= (UINT8)(*p - '0');
+                else if (*p >= 'A' && *p <= 'F') b |= (UINT8)(*p - 'A' + 10);
+                else if (*p >= 'a' && *p <= 'f') b |= (UINT8)(*p - 'a' + 10);
+            }
+            pat[plen] = b; mask[plen] = true; ++plen;
+        }
+    }
+    if (!plen) return nullptr;
+
+    auto* dos = (PIMAGE_DOS_HEADER)ntos_base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = (PIMAGE_NT_HEADERS64)((UINT8*)ntos_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    auto name_eq = [](const char* a, const char* b) -> bool {
+        for (int i = 0; i < IMAGE_SIZEOF_SHORT_NAME; ++i) {
+            char ca = a[i], cb = b[i];
+            if (ca != cb) return false;
+            if (ca == '\0') return true;
+        }
+        return true;
+    };
+
+    auto* secs = IMAGE_FIRST_SECTION(nt);
+    for (USHORT si = 0; si < nt->FileHeader.NumberOfSections; ++si) {
+        if (!name_eq((const char*)secs[si].Name, section_name)) continue;
+        auto*  base = (UINT8*)ntos_base + secs[si].VirtualAddress;
+        SIZE_T size = secs[si].Misc.VirtualSize;
+        if (size < plen) continue;
+        for (SIZE_T i = 0; i + plen <= size; ++i) {
+            bool found = true;
+            for (SIZE_T j = 0; j < plen; ++j) {
+                if (mask[j] && base[i + j] != pat[j]) { found = false; break; }
+            }
+            if (!found) continue;
+            if (accept(base + i, size - i, ctx)) return base + i;
+        }
+    }
+    return nullptr;
+}
+
+// NtCreateThreadEx validator: a generic 11-arg syscall prologue match is
+// only acceptable if the function reads gs:[0x188] (KPCR.CurrentThread)
+// somewhere in its first ~512 bytes — that's the hallmark of a syscall
+// service routine and is absent from non-syscall helpers (FsRtl*, Cc*, etc.)
+// that share the same prologue.  We log every candidate so the user can
+// `ln` each address in WinDbg if the validator still misses.
+static bool inj_accept_nt_create_thread_ex(UINT8* hit, SIZE_T remaining, void* ctx) {
+    static const UINT8 gs_read_rax[] = {
+        // mov rax, gs:[0x188]
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x88, 0x01, 0x00, 0x00
+    };
+    static const UINT8 gs_read_rcx[] = {
+        // mov rcx, gs:[0x188]  (some builds load into rcx instead)
+        0x65, 0x48, 0x8B, 0x0C, 0x25, 0x88, 0x01, 0x00, 0x00
+    };
+    static const UINT8 gs_read_rdx[] = {
+        // mov rdx, gs:[0x188]
+        0x65, 0x48, 0x8B, 0x14, 0x25, 0x88, 0x01, 0x00, 0x00
+    };
+
+    // ctx, when non-null, is a counter we increment so the caller can log
+    // every candidate that *didn't* validate, for offline analysis.
+    int* candidate_count = (int*)ctx;
+    if (candidate_count) ++*candidate_count;
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] NtCreateThreadEx candidate at %p — validating...\n",
+               (PVOID)hit);
+
+    // Widen the search to 0x200 bytes (some builds defer the gs read past
+    // earlier validation code).
+    SIZE_T scan_len = remaining > 0x200 ? 0x200 : remaining;
+
+    auto match_at = [&](const UINT8* pat, SIZE_T plen) -> SIZE_T {
+        for (SIZE_T k = 0; k + plen <= scan_len; ++k) {
+            bool ok = true;
+            for (SIZE_T m = 0; m < plen; ++m) {
+                if (hit[k + m] != pat[m]) { ok = false; break; }
+            }
+            if (ok) return k;
+        }
+        return (SIZE_T)-1;
+    };
+
+    SIZE_T off = match_at(gs_read_rax, sizeof(gs_read_rax));
+    if (off == (SIZE_T)-1) off = match_at(gs_read_rcx, sizeof(gs_read_rcx));
+    if (off == (SIZE_T)-1) off = match_at(gs_read_rdx, sizeof(gs_read_rdx));
+
+    if (off != (SIZE_T)-1) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] candidate at %p ACCEPTED (gs[188h] at +0x%llx)\n",
+                   (PVOID)hit, (unsigned long long)off);
+        return true;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] candidate at %p REJECTED (no gs[188h] in first "
+               "0x%llx bytes)\n",
+               (PVOID)hit, (unsigned long long)scan_len);
+    return false;
+}
+
+// Resolve a RIP-relative instruction operand.
+//   instr            = address of the instruction we just located
+//   offset_offset    = byte offset within the instruction at which the disp32 lives
+//                      (e.g. 1 for `E8 dd`, 3 for `48 8B 0D dd`)
+//   instruction_size = total length of the instruction (5 for `E8 dd`,
+//                      6 for `FF 15 dd`, 7 for `48 8B 0D dd`, ...)
+// Returns the absolute target address.  Modeled on kdmapper's
+// ResolveRelativeAddress.
+static PVOID inj_resolve_rel(PVOID instr, ULONG offset_offset, ULONG instruction_size) {
+    if (!instr) return nullptr;
+    LONG disp = *(LONG*)((UINT8*)instr + offset_offset);
+    return (PVOID)((UINT8*)instr + instruction_size + disp);
+}
+
 // RtlCopyMemory / RtlFillMemory / RtlCompareMemory are macros in the WDK —
 // they cannot be cast directly to function pointers.  These thunks provide
 // addressable wrappers with the signatures expected by function_types::.
@@ -136,7 +391,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     if (globals::initialized) return STATUS_SUCCESS;
 
     if (!ntos_base_addr) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                    "[INJECTOR] injector_init_globals: NULL ntos_base_addr\n");
         return STATUS_INVALID_PARAMETER;
     }
@@ -154,7 +409,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
 #define INJ_RESOLVE(field, wname, ftype)                                             \
     globals::field = (ftype)inj_resolve(wname);                                      \
     if (!globals::field)                                                              \
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,                        \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                        \
                    "[INJECTOR] WARNING: " #wname " not found\n");
 
     // Mm — memory management exports
@@ -193,7 +448,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
             globals::mm_user_probe_address =
                 (function_types::mm_user_probe_address_t)(uintptr_t)*p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                        "[INJECTOR] WARNING: MmUserProbeAddress not found\n");
     }
 
@@ -294,8 +549,144 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 function_types::rtl_free_unicode_string_t)
     INJ_RESOLVE(rtl_get_version,                L"RtlGetVersion",
                 function_types::rtl_get_version_t)
+    // RtlCreateUserThread is NOT actually exported by ntoskrnl on most Windows
+    // builds — it lives in ntdll.dll.  The resolve below will warn (NULL) but
+    // we keep the line so the global stays known.  All real inject paths use
+    // nt_create_thread_ex instead.
     INJ_RESOLVE(rtl_create_user_thread,         L"RtlCreateUserThread",
                 function_types::rtl_create_user_thread_t)
+
+    // ────────────────────────────────────────────────────────────────────
+    // NtCreateThreadEx — needed to spawn the user-mode thread that runs
+    // the shellcode.  Resolution chain:
+    //
+    //   1. MmGetSystemRoutineAddress(L"NtCreateThreadEx")
+    //   2. MmGetSystemRoutineAddress(L"ZwCreateThreadEx")
+    //   3. Manual ntoskrnl export-table walk for "NtCreateThreadEx"
+    //   4. Manual ntoskrnl export-table walk for "ZwCreateThreadEx"
+    //   5. Pattern scan of NtCreateThreadEx's function prologue in .text
+    //
+    // (3) and (4) exist because some KDU-mapped loaders interfere with the
+    // import resolution path that MmGetSystemRoutineAddress depends on, and
+    // we've observed (1) and (2) both returning NULL on Win10 19041 even
+    // though the exports do exist in ntoskrnl.exe.  Walking the export
+    // table by hand bypasses that entirely.
+    //
+    // Either NtCreateThreadEx or ZwCreateThreadEx is fine — Zw* is a thin
+    // wrapper that sets PreviousMode = KernelMode before tail-calling
+    // Nt* (or routing through KiSystemServiceCopyEnd on newer builds).
+    // Since we pass kernel-built OBJECT_ATTRIBUTES with OBJ_KERNEL_HANDLE,
+    // either path is correct for our usage.
+    // ────────────────────────────────────────────────────────────────────
+    globals::nt_create_thread_ex =
+        (function_types::nt_create_thread_ex_t)inj_resolve(L"NtCreateThreadEx");
+    const char* nt_create_thread_ex_source = "MmGetSystemRoutineAddress(NtCreateThreadEx)";
+
+    if (!globals::nt_create_thread_ex) {
+        globals::nt_create_thread_ex =
+            (function_types::nt_create_thread_ex_t)inj_resolve(L"ZwCreateThreadEx");
+        if (globals::nt_create_thread_ex)
+            nt_create_thread_ex_source = "MmGetSystemRoutineAddress(ZwCreateThreadEx)";
+    }
+    if (!globals::nt_create_thread_ex) {
+        globals::nt_create_thread_ex =
+            (function_types::nt_create_thread_ex_t)
+                inj_get_export(ntos_base_addr, "NtCreateThreadEx");
+        if (globals::nt_create_thread_ex)
+            nt_create_thread_ex_source = "manual export walk (NtCreateThreadEx)";
+    }
+    if (!globals::nt_create_thread_ex) {
+        globals::nt_create_thread_ex =
+            (function_types::nt_create_thread_ex_t)
+                inj_get_export(ntos_base_addr, "ZwCreateThreadEx");
+        if (globals::nt_create_thread_ex)
+            nt_create_thread_ex_source = "manual export walk (ZwCreateThreadEx)";
+    }
+    if (!globals::nt_create_thread_ex) {
+        // Ground-truth prologue from WinDbg `u nt!NtCreateThreadEx L20` on
+        // Windows 10 22H2 (build 19045) — see WinDbg dump above.
+        //
+        // Try two scans:
+        //   (1) Section-restricted to `.text`
+        //   (2) All code sections (in case the kernel actually puts this
+        //       function in another code section like KVASCODE or PAGE)
+        //
+        // Both should match the same address; if (1) misses but (2) hits,
+        // the section name on this kernel isn't ".text".  Diagnostic output
+        // is emitted so the user can tell which scan worked.
+        const char* nt_ctx_pattern =
+            "40 55 53 56 57 41 54 41 55 41 56 41 57"
+            " 48 81 EC ? ? ? ?"
+            " 48 8D 6C 24 ?"
+            " 48 8B 05 ? ? ? ?"
+            " 48 33 C5"
+            " 48 89 85 ? ? ? ?"
+            " 4D 8B F9"
+            " 4C 89 45 ?"
+            " 89 55 ?"
+            " 48 8B F1";
+
+        PVOID hit = inj_scan_pattern_in_section(
+            ntos_base_addr, ".text", nt_ctx_pattern);
+        if (hit) {
+            globals::nt_create_thread_ex =
+                (function_types::nt_create_thread_ex_t)hit;
+            nt_create_thread_ex_source =
+                "11-push /GS+arg-save pattern (.text)";
+        } else {
+            // Fall back to scanning every IMAGE_SCN_CNT_CODE section.
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                       "[INJECTOR] NtCreateThreadEx: .text section scan "
+                       "missed — trying every code section\n");
+            hit = inj_scan_pattern(ntos_base_addr, nt_ctx_pattern);
+            if (hit) {
+                globals::nt_create_thread_ex =
+                    (function_types::nt_create_thread_ex_t)hit;
+                nt_create_thread_ex_source =
+                    "11-push /GS+arg-save pattern (any CODE section)";
+            }
+        }
+
+        if (!globals::nt_create_thread_ex) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                       "[INJECTOR] NtCreateThreadEx: BOTH section-restricted "
+                       "and all-CODE scans missed — printing PE section "
+                       "layout for diagnosis\n");
+            // Dump every section so we can see what the kernel actually has.
+            auto* dos2 = (PIMAGE_DOS_HEADER)ntos_base_addr;
+            if (dos2->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* nt2 = (PIMAGE_NT_HEADERS64)
+                    ((UINT8*)ntos_base_addr + dos2->e_lfanew);
+                if (nt2->Signature == IMAGE_NT_SIGNATURE) {
+                    auto* secs2 = IMAGE_FIRST_SECTION(nt2);
+                    for (USHORT si = 0; si < nt2->FileHeader.NumberOfSections; ++si) {
+                        char name_buf[9] = {};
+                        for (int n = 0; n < 8; ++n) name_buf[n] = secs2[si].Name[n];
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                                   "[INJECTOR]   section[%u] name='%s' VA=+0x%X "
+                                   "size=0x%X chars=0x%X\n",
+                                   (unsigned)si, name_buf,
+                                   (unsigned)secs2[si].VirtualAddress,
+                                   (unsigned)secs2[si].Misc.VirtualSize,
+                                   (unsigned)secs2[si].Characteristics);
+                    }
+                }
+            }
+        }
+    }
+
+    if (globals::nt_create_thread_ex) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] nt_create_thread_ex = %p (resolved via %s)\n",
+                   (PVOID)globals::nt_create_thread_ex,
+                   nt_create_thread_ex_source);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] WARNING: NtCreateThreadEx unresolved (export "
+                   "lookups via MmGetSystemRoutineAddress and manual walk, "
+                   "plus prologue pattern, all failed) — inject path will "
+                   "be rejected\n");
+    }
 
     // Zw / Nt
     INJ_RESOLVE(zw_open_process,              L"ZwOpenProcess",
@@ -308,6 +699,29 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 function_types::zw_query_information_process_t)
     INJ_RESOLVE(nt_alert_resume_thread,       L"NtAlertResumeThread",
                 function_types::nt_alert_resume_thread_t)
+
+    // ZwResumeThread — replaces PsResumeThread (which is not exported on
+    // Win10 22H2 / 19045 and most newer builds).  Handle-based, decrements
+    // the thread's suspend count.  See injector_execute_dll for the call
+    // site that uses this instead of the old PETHREAD-based PsResumeThread.
+    globals::zw_resume_thread = (function_types::zw_resume_thread_t)
+        inj_resolve(L"ZwResumeThread");
+    if (!globals::zw_resume_thread) {
+        // Fall back to manual export-table walk, then a NtResumeThread alias.
+        globals::zw_resume_thread = (function_types::zw_resume_thread_t)
+            inj_get_export(ntos_base_addr, "ZwResumeThread");
+    }
+    if (!globals::zw_resume_thread) {
+        globals::zw_resume_thread = (function_types::zw_resume_thread_t)
+            inj_resolve(L"NtResumeThread");
+    }
+    if (!globals::zw_resume_thread) {
+        globals::zw_resume_thread = (function_types::zw_resume_thread_t)
+            inj_get_export(ntos_base_addr, "NtResumeThread");
+    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] zw_resume_thread = %p\n",
+               (PVOID)globals::zw_resume_thread);
 
 #undef INJ_RESOLVE
 
@@ -342,7 +756,17 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
 #define INJ_SCAN(field, pattern_str, ftype, sym_name)                        \
     globals::field = (ftype)inj_scan_pattern(ntos_base_addr, pattern_str);   \
     if (!globals::field)                                                       \
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,                 \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                 \
+                   "[INJECTOR] WARNING: pattern scan failed for " sym_name "\n");
+
+// Like INJ_SCAN but tries pat2 before warning.  pat1 = Win10 22H2 (19045),
+// pat2 = fallback for Win11 22H2-24H2 and other builds.
+#define INJ_SCAN2(field, pat1, pat2, ftype, sym_name)                          \
+    globals::field = (ftype)inj_scan_pattern(ntos_base_addr, pat1);            \
+    if (!globals::field)                                                         \
+        globals::field = (ftype)inj_scan_pattern(ntos_base_addr, pat2);         \
+    if (!globals::field)                                                          \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                            \
                    "[INJECTOR] WARNING: pattern scan failed for " sym_name "\n");
 
     INJ_SCAN(ke_flush_single_tb,
@@ -350,30 +774,124 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
              function_types::ke_flush_single_tb_t,
              "KeFlushSingleTb")
 
-    INJ_SCAN(ke_flush_entire_tb,
-             "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 20 0F B6 F1",
-             function_types::ke_flush_entire_tb_t,
-             "KeFlushEntireTb")
+    INJ_SCAN2(ke_flush_entire_tb,
+              // Win10 22H2 (19045): RSP-frame style, BA 03 literal
+              "48 8B C4 48 89 58 08 48 89 68 10 57 48 83 EC 30 BA 03 00 00 00",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 20 0F B6 F1",
+              function_types::ke_flush_entire_tb_t,
+              "KeFlushEntireTb")
 
     INJ_SCAN(ke_invalidate_all_caches,
              "48 83 EC 28 65 48 8B 04 25 88 01 00 00",
              function_types::ke_invalidate_all_caches_t,
              "KeInvalidateAllCaches")
 
-    INJ_SCAN(mm_allocate_independent_pages_ex,
-             "48 89 5C 24 ? 48 89 74 24 ? 55 57 41 56 48 8B EC 48 83 EC 60",
-             function_types::mm_allocate_independent_pages_ex_t,
-             "MmAllocateIndependentPages")
+    // ────────────────────────────────────────────────────────────────────
+    // MmAllocateIndependentPagesEx — modeled on kdmapper/intel_driver.cpp
+    // (line 527+).  Strategy:
+    //
+    //   1. Try exports first (`MmAllocateIndependentPagesEx`, then
+    //      `MmAllocateIndependentPages`).  Some KDU-mapped images have the
+    //      ntoskrnl export table fully resolvable; some don't.
+    //
+    //   2. Fall back to a CALL-SITE pattern inside KeAllocateInterrupt that
+    //      reliably points at a CALL to MmAllocateIndependentPagesEx on every
+    //      build from Win10 1803 to Win11 24H2:
+    //
+    //        41 8B D6 B9 00 10 00 00 E8 ?? ?? ?? ?? 48 8B D8
+    //        ^^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^ ^^^^^^^^
+    //        mov edx,r14d / mov ecx,0x1000 / call X / mov rbx,rax
+    //
+    //      Skip 8 bytes to land on the `E8 ?? ?? ?? ??` (CALL), then resolve
+    //      the disp32 (offset 1, instruction size 5) to get the target VA.
+    //
+    //   The old prologue-only pattern false-matched CcPerfLogWorkItemEnqueue
+    //   and BSOD'd; call-site resolution is immune to that class of false
+    //   match.
+    // ────────────────────────────────────────────────────────────────────
+    globals::mm_allocate_independent_pages_ex =
+        (function_types::mm_allocate_independent_pages_ex_t)
+            inj_resolve(L"MmAllocateIndependentPagesEx");
+    if (!globals::mm_allocate_independent_pages_ex) {
+        globals::mm_allocate_independent_pages_ex =
+            (function_types::mm_allocate_independent_pages_ex_t)
+                inj_resolve(L"MmAllocateIndependentPages");
+    }
+    if (!globals::mm_allocate_independent_pages_ex) {
+        PVOID hit = inj_scan_pattern_in_section(
+            ntos_base_addr, ".text",
+            "41 8B D6 B9 00 10 00 00 E8 ? ? ? ? 48 8B D8");
+        if (hit) {
+            PVOID call_site = (PVOID)((UINT8*)hit + 8);  // step to the E8 disp32
+            globals::mm_allocate_independent_pages_ex =
+                (function_types::mm_allocate_independent_pages_ex_t)
+                    inj_resolve_rel(call_site, 1, 5);
+            if (globals::mm_allocate_independent_pages_ex) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                           "[INJECTOR] MmAllocateIndependentPagesEx: exports "
+                           "absent, resolved via KeAllocateInterrupt call-site "
+                           "= %p\n",
+                           (PVOID)globals::mm_allocate_independent_pages_ex);
+            }
+        }
+    }
+    if (!globals::mm_allocate_independent_pages_ex) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] WARNING: MmAllocateIndependentPagesEx "
+                   "unresolved (export + KeAllocateInterrupt call-site both "
+                   "failed) — falling back to MmAllocateContiguousMemory\n");
+    }
 
     INJ_SCAN(mm_set_page_protection,
              "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 30 41 8B F8 48 8B F2",
              function_types::mm_set_page_protection_t,
              "MmSetPageProtection")
 
-    INJ_SCAN(mm_free_independent_pages,
-             "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 20 48 8B FA 48 8B D9 E8",
-             function_types::mm_free_independent_pages,
-             "MmFreeIndependentPages")
+    // ────────────────────────────────────────────────────────────────────
+    // MmFreeIndependentPages — same call-site approach as the allocate
+    // routine, also modeled on kdmapper/intel_driver.cpp.  Two patterns
+    // cover Win10 (PAGE section, edx=0x6000 literal load) and Win11 (edx
+    // loaded RIP-relative from a global).  Both end with a CALL to
+    // MmFreeIndependentPages followed by `lea rcx,[rbx±??]`.
+    // ────────────────────────────────────────────────────────────────────
+    globals::mm_free_independent_pages =
+        (function_types::mm_free_independent_pages)
+            inj_resolve(L"MmFreeIndependentPages");
+    if (!globals::mm_free_independent_pages) {
+        // Win10 pattern: BA 00 60 00 00 / 48 8B CB / E8 ?? ?? ?? ?? / 48 8D 8B ??
+        PVOID hit = inj_scan_pattern_in_section(
+            ntos_base_addr, "PAGE",
+            "BA 00 60 00 00 48 8B CB E8 ? ? ? ? 48 8D 8B 00 F0 FF FF");
+        ULONG skip = 0;
+        if (hit) {
+            skip = 8;  // step to the E8 disp32
+        } else {
+            // Win11 pattern: 8B 15 ?? ?? ?? ?? / 48 8B CB / E8 ?? ?? ?? ?? / 48 8D 8B
+            hit = inj_scan_pattern_in_section(
+                ntos_base_addr, "PAGE",
+                "8B 15 ? ? ? ? 48 8B CB E8 ? ? ? ? 48 8D 8B");
+            if (hit) skip = 9;
+        }
+        if (hit) {
+            PVOID call_site = (PVOID)((UINT8*)hit + skip);
+            globals::mm_free_independent_pages =
+                (function_types::mm_free_independent_pages)
+                    inj_resolve_rel(call_site, 1, 5);
+            if (globals::mm_free_independent_pages) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                           "[INJECTOR] MmFreeIndependentPages: export absent, "
+                           "resolved via call-site = %p\n",
+                           (PVOID)globals::mm_free_independent_pages);
+            }
+        }
+    }
+    if (!globals::mm_free_independent_pages) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] WARNING: MmFreeIndependentPages unresolved — "
+                   "matching free path will fall through to "
+                   "MmFreeContiguousMemory\n");
+    }
 
     // MiGetPteAddress — the pattern matches the start of the function body.
     // After finding the pattern the function pointer points directly to the
@@ -389,13 +907,21 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     globals::mi_get_pde_address =
         (function_types::mi_get_pde_address_t)inj_resolve(L"MiGetPdeAddress");
     if (!globals::mi_get_pde_address) {
+        // Win10 22H2 (19045): SAR+AND+MOV-imm sequence
+        globals::mi_get_pde_address =
+            (function_types::mi_get_pde_address_t)inj_scan_pattern(
+                ntos_base_addr,
+                "48 C1 E9 12 81 E1 F8 FF FF 3F 48 B8");
+    }
+    if (!globals::mi_get_pde_address) {
+        // Win11 22H2-24H2 fallback: SAR+MOV-imm (no AND masking step)
         globals::mi_get_pde_address =
             (function_types::mi_get_pde_address_t)inj_scan_pattern(
                 ntos_base_addr,
                 "48 C1 E9 12 48 B8 ? ? ? ? ? ? ? ? 48 23 C8 48 B8");
     }
     if (!globals::mi_get_pde_address)
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                    "[INJECTOR] WARNING: MiGetPdeAddress not found (export + pattern)\n");
 
     INJ_SCAN(mi_reserve_ptes,
@@ -403,11 +929,14 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
              function_types::mi_reserve_ptes_t,
              "MiReservePtes")
 
-    INJ_SCAN(mi_flush_entire_tb_due_to_attribute_change,
-             "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
-             " 41 56 41 57 48 83 EC 40 45 33 FF",
-             function_types::mi_flush_entire_tb_due_to_attribute_change_t,
-             "MiFlushEntireTbDueToAttributeChange")
+    INJ_SCAN2(mi_flush_entire_tb_due_to_attribute_change,
+              // Win10 22H2 (19045): sub rsp,E8h + stack cookie prolog
+              "48 81 EC E8 00 00 00 48 8B 05 ? ? ? ? 48 33 C4",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
+              " 41 56 41 57 48 83 EC 40 45 33 FF",
+              function_types::mi_flush_entire_tb_due_to_attribute_change_t,
+              "MiFlushEntireTbDueToAttributeChange")
 
     INJ_SCAN(mi_flush_cache_range,
              "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 49 8B E9",
@@ -419,26 +948,38 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
              function_types::mi_get_page_table_pfn_buddy_raw_t,
              "MiGetPageTablePfnBuddyRaw")
 
-    INJ_SCAN(mi_set_page_table_pfn_buddy,
-             "48 89 5C 24 08 57 48 83 EC 20 48 8B 1A 48 8B F9 48 85 DB 74 ? 48 8B CB",
-             function_types::mi_set_page_table_pfn_buddy_t,
-             "MiSetPageTablePfnBuddy")
+    INJ_SCAN2(mi_set_page_table_pfn_buddy,
+              // Win10 22H2 (19045): saves rdx→rsi, rcx→rdi
+              "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F2 48 8B F9",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 08 57 48 83 EC 20 48 8B 1A 48 8B F9 48 85 DB 74 ? 48 8B CB",
+              function_types::mi_set_page_table_pfn_buddy_t,
+              "MiSetPageTablePfnBuddy")
 
-    INJ_SCAN(mi_lock_page_table_page,
-             "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 44 8B 41 08 48 8B F1",
-             function_types::mi_lock_page_table_page_t,
-             "MiLockPageTablePage")
+    INJ_SCAN2(mi_lock_page_table_page,
+              // Win10 22H2 (19045): 8-reg push chain, xor r15d/r15d, mov r12d,edx
+              "40 53 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 28 45 33 FF 44 8B E2 48 8B D9",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 44 8B 41 08 48 8B F1",
+              function_types::mi_lock_page_table_page_t,
+              "MiLockPageTablePage")
 
-    INJ_SCAN(mi_allocate_large_zero_pages,
-             "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
-             " 41 56 41 57 48 83 EC 40 4D 8B E1",
-             function_types::mi_allocate_large_zero_pages_t,
-             "MiAllocateLargeZeroPages")
+    INJ_SCAN2(mi_allocate_large_zero_pages,
+              // Win10 22H2 (19045): push chain + lea rbp,[rsp-7]
+              "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F9 48 81 EC D8 00 00 00",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
+              " 41 56 41 57 48 83 EC 40 4D 8B E1",
+              function_types::mi_allocate_large_zero_pages_t,
+              "MiAllocateLargeZeroPages")
 
-    INJ_SCAN(mi_create_decay_pfn,
-             "40 53 48 83 EC 20 48 8B 59 08 48 8B D1 33 C9 E8",
-             function_types::mi_create_decay_pfn_t,
-             "MiCreateDecayPfn")
+    INJ_SCAN2(mi_create_decay_pfn,
+              // Win10 22H2 (19045): 3-reg save + lea rcx,[rip+?] + call + mov rdi,rax
+              "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8B F8",
+              // Win11 22H2-24H2 fallback
+              "40 53 48 83 EC 20 48 8B 59 08 48 8B D1 33 C9 E8",
+              function_types::mi_create_decay_pfn_t,
+              "MiCreateDecayPfn")
 
     INJ_SCAN(mi_get_vm_access_logging_partition,
              "48 83 EC 28 65 48 8B 04 25 88 01 00 00 48 8B 80 ? ? ? ?"
@@ -446,11 +987,15 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
              function_types::mi_get_vm_access_logging_partition_t,
              "MiGetVmAccessLoggingPartition")
 
-    INJ_SCAN(mi_remove_physical_memory,
-             "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
-             " 41 56 41 57 48 83 EC 60 0F B7 52 06",
-             function_types::mi_remove_physical_memory_t,
-             "MiRemovePhysicalMemory")
+    INJ_SCAN2(mi_remove_physical_memory,
+              // Win10 22H2 (19045): mov rax,rsp home-arg style
+              "48 8B C4 48 89 58 08 44 89 40 18 48 89 50 10 55 56 57 41 54"
+              " 41 55 41 56 41 57 48 8D 68",
+              // Win11 22H2-24H2 fallback
+              "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55"
+              " 41 56 41 57 48 83 EC 60 0F B7 52 06",
+              function_types::mi_remove_physical_memory_t,
+              "MiRemovePhysicalMemory")
 
     INJ_SCAN(mi_get_ultra_page,
              "4C 8B DC 49 89 5B 08 49 89 73 10 49 89 7B 18 55 41 54 41 55"
@@ -459,6 +1004,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
              "MiGetUltraPage")
 
 #undef INJ_SCAN
+#undef INJ_SCAN2
 
     // PspExitThread — pattern scan only (never exported)
     {
@@ -467,7 +1013,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         if (p)
             globals::psp_exit_thread = (uintptr_t)p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                        "[INJECTOR] WARNING: PspExitThread pattern not found\n");
     }
 
@@ -481,16 +1027,53 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
 
     globals::ntos_base = (uintptr_t)ntos_base_addr;
 
-    // mm_pfn_db: use pml4 subsystem's value if already populated (avoids rescan).
-    // When FINAL-DRV has no pml4 subsystem (g_mmonp_MmPfnDatabase == 0), fall back
-    // to MmGetSystemRoutineAddress — MmPfnDatabase IS in ntoskrnl's export table on
-    // all supported Windows versions and MmGetSystemRoutineAddress returns its address.
+    // mm_pfn_db: mem.cpp dereferences this as *mm_pfn_db to get the PFN array base,
+    // so it must hold &MmPfnDatabase (the address of the kernel global), NOT its value.
+    // pml4::g_mmonp_MmPfnDatabase follows the same convention (it is &MmPfnDatabase).
+    // When no pml4 subsystem is present, inj_resolve returns &MmPfnDatabase directly —
+    // do NOT dereference it before storing.
     globals::mm_pfn_db = pml4::g_mmonp_MmPfnDatabase;
     if (!globals::mm_pfn_db) {
         PVOID* pfn_ptr = (PVOID*)inj_resolve(L"MmPfnDatabase");
         if (pfn_ptr)
-            globals::mm_pfn_db = (uintptr_t)*pfn_ptr;
+            globals::mm_pfn_db = (uintptr_t)pfn_ptr;  // store &MmPfnDatabase, not MmPfnDatabase
     }
+    // MmPfnDatabase was removed from the ntoskrnl export table on hardened Win10 22H2
+    // builds.  Fall back to the manual export walk first, then scan the body of
+    // MmGetVirtualForPhysical (which IS exported) for the first RIP-relative 64-bit
+    // load — on every observed Win10/11 build this is the load of MmPfnDatabase.
+    if (!globals::mm_pfn_db) {
+        PVOID* pfn_ptr = (PVOID*)inj_get_export(ntos_base_addr, "MmPfnDatabase");
+        if (pfn_ptr)
+            globals::mm_pfn_db = (uintptr_t)pfn_ptr;
+    }
+    if (!globals::mm_pfn_db && globals::mm_get_virtual_for_physical) {
+        auto* fn = reinterpret_cast<UINT8*>(globals::mm_get_virtual_for_physical);
+        for (int i = 0; i < 0x80 - 6; ++i) {
+            // REX.W + MOV reg, [RIP+disp32]: 48 8B {05,0D,15,1D,...} disp32
+            if (fn[i] == 0x48 && fn[i + 1] == 0x8B &&
+                (fn[i + 2] & 0xC7) == 0x05) {
+                PVOID target = inj_resolve_rel(&fn[i], 3, 7);
+                if ((uintptr_t)target > 0xFFFF800000000000ULL) {
+                    uintptr_t candidate = *(uintptr_t*)target;
+                    // PFN database sits in the range ffffe... on Win10/11
+                    if (candidate >= 0xFFFFE00000000000ULL &&
+                        candidate <  0xFFFFF00000000000ULL) {
+                        globals::mm_pfn_db = (uintptr_t)target;
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                                   "[INJECTOR] MmPfnDatabase: resolved via "
+                                   "MmGetVirtualForPhysical body scan = %p "
+                                   "(value=%p)\n",
+                                   target, (PVOID)candidate);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!globals::mm_pfn_db)
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] WARNING: MmPfnDatabase not found\n");
 
     // ps_loaded_module_list: MmGetSystemRoutineAddress returns the address of
     // the PsLoadedModuleList LIST_ENTRY exported from ntoskrnl.
@@ -499,7 +1082,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         if (p)
             globals::ps_loaded_module_list = (uintptr_t)p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                        "[INJECTOR] WARNING: PsLoadedModuleList not found\n");
     }
 
@@ -509,12 +1092,45 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         osvi.dwOSVersionInfoSize = sizeof(osvi);
         globals::rtl_get_version(&osvi);
         globals::build_version = osvi.dwBuildNumber;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                    "[INJECTOR] build_version = %lu\n", globals::build_version);
     }
 
-    // mm_highest_physical_page / mm_lowest_physical_page — populated by
-    // physical::init() below; leave at 0 until then.
+    // mm_highest_physical_page / mm_lowest_physical_page — required before any
+    // physical r/w: is_pfn_valid() gates every read_physical_address call and
+    // physical::init() does NOT populate these. Try two sources in order:
+    //   1. ntoskrnl data exports MmHighestPhysicalPage / MmLowestPhysicalPage
+    //   2. Walk MmGetPhysicalMemoryRanges to find the true extents
+    {
+        uintptr_t* p = (uintptr_t*)inj_resolve(L"MmHighestPhysicalPage");
+        if (p) globals::mm_highest_physical_page = *p;
+
+        p = (uintptr_t*)inj_resolve(L"MmLowestPhysicalPage");
+        if (p) globals::mm_lowest_physical_page = *p;
+
+        // Fallback: walk MmGetPhysicalMemoryRanges if either value is still 0.
+        // This handles builds where the exports are absent or return 0.
+        if (!globals::mm_highest_physical_page && globals::mm_get_physical_memory_ranges) {
+            PPHYSICAL_MEMORY_RANGE ranges = globals::mm_get_physical_memory_ranges();
+            if (ranges) {
+                for (PPHYSICAL_MEMORY_RANGE r = ranges; r->NumberOfBytes.QuadPart; ++r) {
+                    uintptr_t lo = (uintptr_t)(r->BaseAddress.QuadPart >> PAGE_SHIFT);
+                    uintptr_t hi = (uintptr_t)((r->BaseAddress.QuadPart +
+                                                r->NumberOfBytes.QuadPart - 1) >> PAGE_SHIFT);
+                    if (!globals::mm_lowest_physical_page || lo < globals::mm_lowest_physical_page)
+                        globals::mm_lowest_physical_page = lo;
+                    if (hi > globals::mm_highest_physical_page)
+                        globals::mm_highest_physical_page = hi;
+                }
+                ExFreePool(ranges);
+            }
+        }
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] physical page range: pfn 0x%llx - 0x%llx\n",
+                   (unsigned long long)globals::mm_lowest_physical_page,
+                   (unsigned long long)globals::mm_highest_physical_page);
+    }
 
     // Known-good EPROCESS/KPROCESS structural offsets for Win10/11 (19041–26100).
     // These are only consumed by the hyperspace path, which is disabled, so
@@ -547,7 +1163,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     {
         NTSTATUS phys_st = physical::init();
         if (!NT_SUCCESS(phys_st))
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                        "[INJECTOR] WARNING: physical::init() failed: 0x%08X"
                        " — contiguous-window alloc unavailable\n", phys_st);
         // Do NOT return failure here; standard alloc modes remain operational.
@@ -558,19 +1174,34 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     // ─────────────────────────────────────────────────────────────────────
     globals::initialized = true;
 
-    // Both of these are exercised on every allocation call.  If either is
-    // absent the driver will null-deref on the first inject attempt.
-    if (!globals::mm_allocate_independent_pages_ex || !globals::mi_get_pte_address) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+    // mm_allocate_independent_pages_ex is allowed to be NULL — mem.cpp
+    // transparently falls back to MmAllocateContiguousMemory in that case.
+    // The remaining two are non-negotiable for any inject codepath.
+    if (!globals::mi_get_pte_address || !globals::nt_create_thread_ex) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                    "[INJECTOR] FATAL: critical pointers missing —"
-                   " mm_allocate_independent_pages_ex=%p  mi_get_pte_address=%p\n",
-                   (PVOID)(uintptr_t)globals::mm_allocate_independent_pages_ex,
-                   (PVOID)(uintptr_t)globals::mi_get_pte_address);
+                   " mi_get_pte_address=%p  nt_create_thread_ex=%p"
+                   "  (mm_allocate_independent_pages_ex=%p — NULL is OK,"
+                   " contiguous-memory fallback in mem.cpp)\n",
+                   (PVOID)(uintptr_t)globals::mi_get_pte_address,
+                   (PVOID)(uintptr_t)globals::nt_create_thread_ex,
+                   (PVOID)(uintptr_t)globals::mm_allocate_independent_pages_ex);
         globals::initialized = false;
         return STATUS_UNSUCCESSFUL;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] critical pointers:"
+               " mm_allocate_independent_pages_ex=%p"
+               "  mm_free_independent_pages=%p"
+               "  mm_allocate_contiguous_memory=%p"
+               "  mm_free_contiguous_memory=%p\n",
+               (PVOID)(uintptr_t)globals::mm_allocate_independent_pages_ex,
+               (PVOID)(uintptr_t)globals::mm_free_independent_pages,
+               (PVOID)(uintptr_t)globals::mm_allocate_contiguous_memory,
+               (PVOID)(uintptr_t)globals::mm_free_contiguous_memory);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
                "[INJECTOR] injector_init_globals: OK"
                " (build=%lu  pfn_db=0x%llx)\n",
                globals::build_version,

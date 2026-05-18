@@ -110,10 +110,12 @@ namespace globals {
   extern function_types::rtl_free_unicode_string_t rtl_free_unicode_string;
   extern function_types::rtl_get_version_t rtl_get_version;
   extern function_types::rtl_create_user_thread_t rtl_create_user_thread;
+  extern function_types::nt_create_thread_ex_t nt_create_thread_ex;
 
   extern function_types::zw_open_process_t zw_open_process;
   extern function_types::zw_close_t zw_close;
   extern function_types::zw_wait_for_single_object_t zw_wait_for_single_object;
+  extern function_types::zw_resume_thread_t zw_resume_thread;
   extern function_types::zw_query_information_process_t zw_query_information_process;
   extern function_types::nt_alert_resume_thread_t nt_alert_resume_thread;
 

@@ -68,6 +68,7 @@ typedef struct _CODE_CAVE {
     PVOID   cave_address;       // VA of the first 0xCC after a 0xC3
     SIZE_T  cave_size;          // Number of consecutive 0xCC bytes found
     BOOLEAN is_valid;           // TRUE if the cave is usable
+    UINT8   patch_size;         // Number of bytes written by PatchCaveWithJump (for cleanup)
     CHAR    module_name[64];    // Short name of the module, e.g. "ntoskrnl.exe"
 } CODE_CAVE, *PCODE_CAVE;
 
@@ -103,18 +104,19 @@ typedef struct _CODE_CAVE {
 // padding runs of 18 bytes still occur frequently in ntoskrnl (.text after
 // large leaf functions); the priority module list (ntoskrnl → hal → CI →
 // fltmgr) almost always finds a hit on the first module.
+//
+// For smaller modules (hal.dll, CI.dll, fltmgr.sys), we use a smaller minimum
+// that can accommodate rel32 jumps (9 bytes) with alignment slack.
 // ============================================================================
 #define CAVE_PATCH_ENDBR  4
 #define CAVE_PATCH_REL32  (CAVE_PATCH_ENDBR + 5)    //  9 bytes
 #define CAVE_PATCH_ABS64  (CAVE_PATCH_ENDBR + 14)   // 18 bytes
 #define CAVE_MIN_SIZE     CAVE_PATCH_REL32
-// CAVE_RUN_MIN must accommodate worst-case 16-byte alignment slack PLUS the
-// abs64 patch: up to 15 bytes are skipped to reach a 16-byte boundary, then
-// 18 bytes are needed for ENDBR + JMP[rip+0] + abs64.  Kernel CFG fast-fails
-// any indirect-call target that isn't 16-aligned (`test cl, 0Fh`), so the
-// scanner must hand back a 16-aligned cave_address — and any byte run shorter
-// than 33 bytes can't guarantee one with enough patch space after.
-#define CAVE_RUN_MIN      33
+
+// Different minimums for different module types
+#define CAVE_RUN_MIN_NTOSKRNL      33  // Large module, needs abs64 support
+#define CAVE_RUN_MIN_SMALL_MODULE  20  // Smaller modules, rel32 is enough
+#define CAVE_RUN_MIN_DEFAULT       CAVE_RUN_MIN_SMALL_MODULE
 
 // ============================================================================
 // Forward declarations for RtlImageNtHeaderEx (undocumented but stable since Win8)
@@ -223,18 +225,46 @@ namespace CodeCave {
 
         PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
         for (USHORT i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-            // Exact ".text\0\0\0" match.  Section names are an 8-byte field
-            // (IMAGE_SIZEOF_SHORT_NAME); a 5-byte memcmp would also accept
-            // ".textbss" (uninitialized RW, would BSOD on write) or hypothetical
-            // ".text$mn" sub-sections.  Final linked kernel images use just
-            // ".text", so require all 8 bytes to match.
+            // Check for executable code sections. We accept:
+            // 1. Exact ".text\0\0\0" match (standard)
+            // 2. ".text$" prefix (subsections in some builds)
+            // 3. "PAGE" or "INIT" sections that are executable
             static const UCHAR kDotText[8] = { '.','t','e','x','t', 0, 0, 0 };
+            
+            BOOLEAN isTextSection = FALSE;
+            
+            // Exact ".text" match
             if (memcmp(pSec[i].Name, kDotText, 8) == 0) {
+                isTextSection = TRUE;
+            }
+            // ".text$" prefix (5 characters)
+            else if (memcmp(pSec[i].Name, kDotText, 5) == 0 && pSec[i].Name[5] == '$') {
+                isTextSection = TRUE;
+            }
+            // Check if section is executable and not discardable
+            else if ((pSec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                     !(pSec[i].Characteristics & IMAGE_SCN_MEM_DISCARDABLE) &&
+                     (pSec[i].Characteristics & IMAGE_SCN_CNT_CODE)) {
+                // Additional check: section name starts with '.' (common for code sections)
+                if (pSec[i].Name[0] == '.') {
+                    isTextSection = TRUE;
+                }
+            }
+            
+            if (isTextSection) {
                 *TextStart = (PUCHAR)ModuleBase + pSec[i].VirtualAddress;
                 *TextSize  = pSec[i].Misc.VirtualSize;
+                
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] GetTextSectionRange: found executable section '%.8s' at %p (size=%zu)\n",
+                           pSec[i].Name, *TextStart, *TextSize);
                 return STATUS_SUCCESS;
             }
         }
+        
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] GetTextSectionRange: no executable .text section found in module %p\n",
+                   ModuleBase);
         return STATUS_NOT_FOUND;
     }
 
@@ -339,18 +369,21 @@ namespace CodeCave {
         _In_ PUCHAR Start,
         _In_ SIZE_T Length,
         _In_ SIZE_T MinCaveSize,
+        _In_ BOOLEAN IsLargeModule,  // TRUE for ntoskrnl, FALSE for smaller modules
         _Out_ PUCHAR *OutCaveStart)
     {
         *OutCaveStart = nullptr;
         if (Length < (MinCaveSize + 1)) return 0; // need RET + at least N bytes
 
-        // Require RUN_MIN consecutive 0xCC bytes to qualify — short runs
-        // (1–4 bytes) can be immediates inside a real instruction, and
-        // patching one of those replaces live code → BSOD on next dispatch.
-        // RUN_MIN also accommodates worst-case 16-byte alignment slack so we
-        // can always find an aligned position inside the run with enough
-        // patch space after it.
-        const SIZE_T runMin = (MinCaveSize > CAVE_RUN_MIN) ? MinCaveSize : CAVE_RUN_MIN;
+        // Use different minimums based on module size
+        // Large modules (ntoskrnl) need space for abs64 jumps
+        // Small modules can work with rel32 jumps
+        const SIZE_T runMin = IsLargeModule ? CAVE_RUN_MIN_NTOSKRNL : CAVE_RUN_MIN_SMALL_MODULE;
+        
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] FindCaveInRange: scanning %zu bytes, runMin=%zu, IsLargeModule=%d\n",
+                   Length, runMin, IsLargeModule);
+        
         if (Length < (runMin + 1)) return 0;
 
         for (SIZE_T i = 0; i <= Length - (runMin + 1); i++) {
@@ -370,24 +403,33 @@ namespace CodeCave {
             PUCHAR runStart  = &Start[i + 1];
             PUCHAR runEnd    = runStart + cc_count;
 
-            // Advance runStart to the next 16-byte-aligned position.
+            // For large modules (ntoskrnl), we need 16-byte alignment for CFG
+            // For smaller modules, we can be more flexible
+            ULONG_PTR alignRequirement = IsLargeModule ? 16 : 8;
+            
+            // Advance runStart to the next aligned position.
             ULONG_PTR runStartVA  = (ULONG_PTR)runStart;
-            ULONG_PTR alignOffset = (16 - (runStartVA & 0xF)) & 0xF;
+            ULONG_PTR alignOffset = (alignRequirement - (runStartVA & (alignRequirement - 1))) & (alignRequirement - 1);
             PUCHAR    alignedStart = runStart + alignOffset;
 
-            // Verify that the aligned position is still inside the run AND
-            // has at least CAVE_PATCH_ABS64 bytes of 0xCC after it.
+            // Verify that the aligned position is still inside the run
             if (alignedStart >= runEnd) {
                 i += cc_count;
                 continue;
             }
+            
             SIZE_T usable = (SIZE_T)(runEnd - alignedStart);
-            if (usable < (SIZE_T)CAVE_PATCH_ABS64) {
-                // Worst case shouldn't hit this given runMin = 33, but
-                // defend against future changes to the constants.
+            
+            // Check if we have enough space for the appropriate patch type
+            SIZE_T requiredSize = IsLargeModule ? CAVE_PATCH_ABS64 : CAVE_PATCH_REL32;
+            if (usable < (SIZE_T)requiredSize) {
                 i += cc_count;
                 continue;
             }
+            
+            DbgPrintEx(0x4d, 0xffffffff,
+                       "[CR3-IPC] FindCaveInRange: found potential cave: run %p+%zu, aligned %p, usable %zu, required %zu\n",
+                       runStart, cc_count, alignedStart, usable, requiredSize);
 
             *OutCaveStart = alignedStart;
             return usable;
@@ -456,13 +498,54 @@ namespace CodeCave {
                 }
                 if (match) {
                     modBase = m.ImageBase;
+                    DbgPrintEx(0x4d, 0xffffffff,
+                               "[CR3-IPC] FindCodeCave: found module %s at %p (path: %s)\n",
+                               ModuleName, modBase, path);
                     break;
                 }
+            }
+            
+            // Also try case-insensitive substring match for flexibility
+            // Some modules might have slightly different names in the path
+            BOOLEAN substringMatch = FALSE;
+            for (SIZE_T pos = 0; pos <= pathLen - nameLen; pos++) {
+                BOOLEAN match = TRUE;
+                for (SIZE_T j = 0; j < nameLen; j++) {
+                    char a = path[pos + j];
+                    char b = name[j];
+                    if (a >= 'A' && a <= 'Z') a += 32;
+                    if (b >= 'A' && b <= 'Z') b += 32;
+                    if (a != b) { match = FALSE; break; }
+                }
+                if (match) {
+                    substringMatch = TRUE;
+                    break;
+                }
+            }
+            
+            if (substringMatch) {
+                modBase = m.ImageBase;
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] FindCodeCave: found module %s (substring match) at %p (path: %s)\n",
+                           ModuleName, modBase, path);
+                break;
+            }
+            
+            // Debug: print all modules if we're looking for specific ones
+            if (strstr(ModuleName, "hal") || strstr(ModuleName, "CI") || strstr(ModuleName, "fltmgr")) {
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] FindCodeCave: module[%lu]: %s at %p (size: %lu)\n",
+                           i, path, m.ImageBase, m.ImageSize);
             }
         }
         ExFreePool(pMods);
 
-        if (!modBase) return STATUS_NOT_FOUND;
+        if (!modBase) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                       "[CR3-IPC] FindCodeCave: module %s not found in system module list\n",
+                       ModuleName);
+            return STATUS_NOT_FOUND;
+        }
 
         // Locate .text section
         PVOID textStart = nullptr;
@@ -470,12 +553,69 @@ namespace CodeCave {
         st = GetTextSectionRange(modBase, &textStart, &textSize);
         if (!NT_SUCCESS(st)) return st;
 
-        // Scan .text for a cave
+        // Determine if this is a large module (ntoskrnl) or small module
+        BOOLEAN isLargeModule = (strstr(ModuleName, "ntoskrnl") != nullptr);
+        
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] FindCodeCave: scanning %s, text section %p+%zu, isLargeModule=%d\n",
+                   ModuleName, textStart, textSize, isLargeModule);
+        
+        // Scan .text for a cave - try with appropriate settings first
         PUCHAR caveStart = nullptr;
         SIZE_T caveSize = FindCaveInRange(
-            (PUCHAR)textStart, textSize, CAVE_MIN_SIZE, &caveStart);
+            (PUCHAR)textStart, textSize, CAVE_MIN_SIZE, isLargeModule, &caveStart);
 
-        if (!caveSize || !caveStart) return STATUS_NOT_FOUND;
+        // If no cave found with standard settings, try more relaxed settings for small modules
+        if (!caveSize || !caveStart) {
+            if (!isLargeModule) {
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] FindCodeCave: no cave found with standard settings, trying relaxed scan for %s\n",
+                           ModuleName);
+                
+                // Try with even smaller requirements
+                // For very small modules, we might need to accept smaller caves
+                const SIZE_T relaxedRunMin = 12;  // Enough for ENDBR64 + rel32 with some alignment slack
+                
+                // Simple scan without strict alignment requirements
+                for (SIZE_T i = 0; i <= textSize - (relaxedRunMin + 1); i++) {
+                    PUCHAR current = (PUCHAR)textStart + i;
+                    
+                    // Look for RET (0xC3) followed by enough 0xCC bytes
+                    if (*current != 0xC3) continue;
+                    
+                    SIZE_T cc_count = 0;
+                    for (SIZE_T j = 1; j < textSize - i && ((PUCHAR)textStart)[i + j] == 0xCC; j++) {
+                        cc_count++;
+                    }
+                    
+                    if (cc_count >= CAVE_PATCH_REL32) {
+                        // Found a suitable cave
+                        caveStart = (PUCHAR)textStart + i + 1;
+                        caveSize = cc_count;
+                        
+                        // Try to align to at least 8 bytes if possible
+                        ULONG_PTR caveVa = (ULONG_PTR)caveStart;
+                        ULONG_PTR alignOffset = (8 - (caveVa & 7)) & 7;
+                        if (alignOffset < caveSize) {
+                            caveStart += alignOffset;
+                            caveSize -= alignOffset;
+                        }
+                        
+                        DbgPrintEx(0x4d, 0xffffffff,
+                                   "[CR3-IPC] FindCodeCave: found relaxed cave in %s at %p (size=%zu)\n",
+                                   ModuleName, caveStart, caveSize);
+                        break;
+                    }
+                }
+            }
+            
+            if (!caveSize || !caveStart) {
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] FindCodeCave: no suitable cave found in %s (text size=%zu)\n",
+                           ModuleName, textSize);
+                return STATUS_NOT_FOUND;
+            }
+        }
 
         OutCave->module_base  = modBase;
         OutCave->cave_address = caveStart;
@@ -621,6 +761,9 @@ namespace CodeCave {
             return STATUS_BUFFER_TOO_SMALL;
         }
 
+        // Record how many bytes were written so UnpatchCave can restore them.
+        Cave->patch_size = (UINT8)patchSize;
+
         // ─── Primary: MmMapIoSpace write ──────────────────────────────────
         // Map the physical page backing the cave as a new writable VA.
         // This bypasses CR0.WP entirely and works under boot-time hypervisors
@@ -710,6 +853,98 @@ namespace CodeCave {
     }
 
     // ============================================================================
+    // Restore a previously-patched code cave to its original 0xCC fill.
+    //
+    // Must be called only after every thread whose start routine points into
+    // the cave has fully terminated (i.e. after KeWaitForSingleObject on each
+    // worker PETHREAD succeeds).  Executing code cannot be in the cave while
+    // we overwrite it.
+    //
+    // Uses the same MmMapIoSpace-primary / CR0.WP-fallback write path as
+    // PatchCaveWithJump so the write succeeds under identical conditions.
+    //
+    // On success, Cave->is_valid and Cave->patch_size are zeroed so callers
+    // can tell the cave is no longer active.
+    // ============================================================================
+    __forceinline NTSTATUS UnpatchCave(_In_ PCODE_CAVE Cave)
+    {
+        // cave_address and patch_size are the meaningful indicators that a
+        // patch was actually written.  is_valid can be FALSE if DriverEntry's
+        // post-patch verification block zeroed the struct after a transient
+        // read fault — callers restore is_valid to TRUE before calling here.
+        if (!Cave || !Cave->cave_address)
+            return STATUS_INVALID_PARAMETER;
+        if (!Cave->patch_size || Cave->patch_size > CAVE_PATCH_ABS64)
+            return STATUS_INVALID_PARAMETER;
+
+        if (IsHvciActive()) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                       "[CR3-IPC] CodeCave: HVCI active — skipping unpatch\n");
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        if (!MmIsAddressValid(Cave->cave_address)) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                       "[CR3-IPC] CodeCave: cave %p not accessible for unpatch\n",
+                       Cave->cave_address);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        // Restore buffer: all 0xCC (original padding bytes).
+        UINT8 restore[CAVE_PATCH_ABS64];
+        RtlFillMemory(restore, Cave->patch_size, 0xCC);
+
+        BOOLEAN writeOk = FALSE;
+
+        PHYSICAL_ADDRESS cavePa = MmGetPhysicalAddress(Cave->cave_address);
+        if (cavePa.QuadPart != 0) {
+            ULONG_PTR pageOff = (ULONG_PTR)Cave->cave_address & (PAGE_SIZE - 1);
+            PHYSICAL_ADDRESS pagePA;
+            pagePA.QuadPart = cavePa.QuadPart - (LONGLONG)pageOff;
+
+            PVOID mapped = MmMapIoSpace(pagePA, PAGE_SIZE, MmNonCached);
+            if (mapped) {
+                PVOID writeDst = (PUCHAR)mapped + pageOff;
+                RtlCopyMemory(writeDst, restore, Cave->patch_size);
+                MmUnmapIoSpace(mapped, PAGE_SIZE);
+                writeOk = TRUE;
+                DbgPrintEx(0x4d, 0xffffffff,
+                           "[CR3-IPC] CodeCave: unpatched %u bytes via MmMapIoSpace "
+                           "(PA=%llX)\n", Cave->patch_size, cavePa.QuadPart);
+            }
+        }
+
+        if (!writeOk) {
+            KIRQL oldIrql;
+            KeRaiseIrql(HIGH_LEVEL, &oldIrql);
+            _disable();
+
+            const ULONG_PTR cr0 = __readcr0();
+            const ULONG_PTR WP  = (ULONG_PTR)0x10000;
+            __writecr0(cr0 & ~WP);
+
+            RtlCopyMemory(Cave->cave_address, restore, Cave->patch_size);
+
+            __writecr0(cr0);
+            __invlpg(Cave->cave_address);
+
+            _enable();
+            KeLowerIrql(oldIrql);
+        }
+
+        __invlpg(Cave->cave_address);
+        KeMemoryBarrier();
+
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CodeCave: unpatch complete — %u bytes at %p restored to 0xCC\n",
+                   Cave->patch_size, Cave->cave_address);
+
+        Cave->is_valid   = FALSE;
+        Cave->patch_size = 0;
+        return STATUS_SUCCESS;
+    }
+
+    // ============================================================================
     // Attempt cave discovery across a prioritized list of kernel modules.
     //
     // Priority order:
@@ -722,8 +957,15 @@ namespace CodeCave {
     // ============================================================================
     __forceinline NTSTATUS FindAndPatchAnyCave(
         _In_ PVOID ThreadFunction,
-        _Out_ PCODE_CAVE OutCave)
+        _Inout_ PCODE_CAVE OutCave)
     {
+        // If OutCave already holds a patched cave (e.g. driver re-init),
+        // restore the original 0xCC bytes before overwriting the descriptor.
+        if (OutCave && OutCave->is_valid && OutCave->patch_size > 0) {
+            UnpatchCave(OutCave);
+        }
+        if (OutCave) RtlZeroMemory(OutCave, sizeof(CODE_CAVE));
+
         static const char* g_priority_modules[] = {
             "ntoskrnl.exe",
             "hal.dll",

@@ -108,10 +108,12 @@ namespace globals {
   extern function_types::rtl_free_unicode_string_t rtl_free_unicode_string = nullptr;
   extern function_types::rtl_get_version_t rtl_get_version = nullptr;
   extern function_types::rtl_create_user_thread_t rtl_create_user_thread = nullptr;
+  extern function_types::nt_create_thread_ex_t nt_create_thread_ex = nullptr;
 
   extern function_types::zw_open_process_t zw_open_process = nullptr;
   extern function_types::zw_close_t zw_close = nullptr;
   extern function_types::zw_wait_for_single_object_t zw_wait_for_single_object = nullptr;
+  extern function_types::zw_resume_thread_t zw_resume_thread = nullptr;
   extern function_types::zw_query_information_process_t zw_query_information_process = nullptr;
   extern function_types::nt_alert_resume_thread_t nt_alert_resume_thread = nullptr;
 

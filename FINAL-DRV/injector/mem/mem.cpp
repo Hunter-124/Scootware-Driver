@@ -106,6 +106,26 @@ namespace mem {
    * Implements various memory hiding techniques via MmPfnDatabase manipulation
    */
   auto hide_physical_memory(uintptr_t page_frame_number, hide_type type, bool lock_page) -> bool {
+    // Fast path: NONE means "don't hide" — skip every dereference below.
+    // This MUST run before the mm_pfn_db deref because dll_hide_type=NONE
+    // is the default and mm_pfn_db is allowed to be NULL on builds where
+    // the MmPfnDatabase export isn't present (Win10 22H2 / 19045 strips it).
+    // Without this early-out, NONE callers crash at `add rsi, [rax]` while
+    // computing pfn_entry_addr from a NULL global.
+    if (type == hide_type::NONE) {
+      (void)page_frame_number;
+      (void)lock_page;
+      return true;
+    }
+
+    // Every non-NONE mode requires MmPfnDatabase.  Fail cleanly if the global
+    // wasn't resolvable instead of dereferencing NULL.
+    if (!globals::mm_pfn_db) {
+      log("ERROR", "hide_physical_memory(%llu): MmPfnDatabase unresolved on "
+                   "this build — cannot hide", (unsigned long long)page_frame_number);
+      return false;
+    }
+
     if (!validation::is_pfn_valid(page_frame_number)) {
       log("ERROR", "invalid PFN range: 0x%llx", page_frame_number);
       return false;
@@ -117,13 +137,14 @@ namespace mem {
     auto* e3_field = reinterpret_cast<_MMPFNENTRY3*>(pfn_entry_addr + 0x23);
     auto* u2_field = reinterpret_cast<_MIPFNBLINK*>(pfn_entry_addr + 0x18);
 
-    if (lock_page && globals::mi_lock_page_table_page) {
-      auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-      if (!lock_result) {
-        log("ERROR", "failed to lock page table page for PFN: 0x%llx", page_frame_number);
-        return 0;
-      }
-    }
+    // mi_lock_page_table_page is pattern-scanned from ntoskrnl; its real
+    // signature drifts across Windows builds.  Calling it with the typedef
+    // in def.hpp (2 args) when the real function takes more args reads
+    // garbage off the caller's stack frame and corrupts the /GS cookie
+    // (DRIVER_OVERRAN_STACK_BUFFER 0xF7 on function exit).  Skip it.  The
+    // pages we install are non-pageable in practice — they come from
+    // MmAllocateIndependentPages which marks them as such.
+    (void)lock_page;
 
     switch (type) {
       case hide_type::NONE: {
@@ -257,7 +278,23 @@ namespace mem {
    * techniques. Memory is hidden according to global settings.
    */
   auto allocate_independent_pages(size_t size) -> void* {
-    void* base_address = globals::mm_allocate_independent_pages_ex(size, -1, 0, 0);
+    // Try MmAllocateIndependentPagesEx first (the original design's choice).
+    // If it's NULL on this Windows build (it is unexported on certain Win10
+    // revisions including 19041 servicing), fall back to
+    // MmAllocateContiguousMemory, which IS universally exported and gives us
+    // page-aligned non-paged kernel memory with the same PFN-installable
+    // properties the manual-map path needs.  The pattern scan used to
+    // synthesize a value for this pointer caused 0xF7 BSODs because the
+    // generic save-regs prologue pattern false-matched CcPerfLogWorkItemEnqueue.
+    void* base_address = nullptr;
+    if (globals::mm_allocate_independent_pages_ex) {
+        base_address = globals::mm_allocate_independent_pages_ex(size, -1, 0, 0);
+    } else {
+        PHYSICAL_ADDRESS max_address{};
+        max_address.QuadPart = ((ULONG64) ~((ULONG64)0));
+        base_address = globals::mm_allocate_contiguous_memory(size, max_address);
+    }
+
     if (!base_address) {
       log("ERROR", "failed to allocate independent page");
       return 0;
@@ -267,7 +304,13 @@ namespace mem {
 
     uintptr_t pfn = page_table::virtual_to_physical(base_address).QuadPart >> PAGE_SHIFT;
     if (!pfn) {
-      globals::mm_free_independent_pages(reinterpret_cast<uintptr_t>(base_address), size);
+      // Free via whichever path we allocated through.
+      if (globals::mm_free_independent_pages) {
+          globals::mm_free_independent_pages(
+              reinterpret_cast<uintptr_t>(base_address), size);
+      } else if (globals::mm_free_contiguous_memory) {
+          globals::mm_free_contiguous_memory(base_address);
+      }
       log("ERROR", "failed to get pfn for page");
       return 0;
     }
@@ -275,7 +318,12 @@ namespace mem {
     bool hide_status =
         mem::hide_physical_memory(pfn, static_cast<hide_type>(globals::dll_hide_type));
     if (!hide_status) {
-      globals::mm_free_independent_pages(reinterpret_cast<uintptr_t>(base_address), size);
+      if (globals::mm_free_independent_pages) {
+          globals::mm_free_independent_pages(
+              reinterpret_cast<uintptr_t>(base_address), size);
+      } else if (globals::mm_free_contiguous_memory) {
+          globals::mm_free_contiguous_memory(base_address);
+      }
       log("ERROR", "failed to hide pfn for page");
       return 0;
     }
@@ -355,16 +403,9 @@ namespace mem {
       return 0;
     }
 
-    const auto pfn_entry_addr = *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (pfn);
-
-    // lock in physical memory — skip gracefully if pattern scan missed this build
-    if (globals::mi_lock_page_table_page) {
-      auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-      if (!lock_result) {
-        log("ERROR", "failed to lock page table page for PFN: 0x%llx", pfn);
-        return 0;
-      }
-    }
+    // mi_lock_page_table_page disabled — see comment in hide_physical_memory.
+    // Calling it with the def.hpp typedef on a build where the real signature
+    // differs corrupts the /GS cookie (0xF7 BSOD on function exit).
 
     return base_address;
   }
@@ -438,21 +479,15 @@ namespace mem {
             return 0;
           };
 
-          const auto pfn_entry_addr =
-              *reinterpret_cast<uintptr_t*>(globals::mm_pfn_db) + 0x30 * (entry.PageFrameNumber);
+          // mi_lock_page_table_page disabled — pattern-scanned signature can
+          // mismatch the running build and corrupt the /GS cookie on return.
+          // The new_table page comes from MmAllocateIndependentPages which is
+          // already non-pageable, so locking is redundant.
 
-          // lock in physical memory — skip gracefully if pattern scan missed this build
-          if (globals::mi_lock_page_table_page) {
-            auto lock_result = globals::mi_lock_page_table_page(pfn_entry_addr, 3);
-            if (!lock_result) {
-              log("ERROR", "failed to lock page table page for PFN: 0x%llx", entry.PageFrameNumber);
-              return 0;
-            }
-          }
-
-          // flush caches
+          // No system-wide TLB shootdown needed: the VA region we're mapping
+          // has never been accessed, so no CPU has a TLB entry to invalidate.
           page_table::flush_caches(new_table);
-          log("INFO", "created and flushed new page table at 0x%llx (entry addr: 0x%llx)",
+          log("INFO", "created new page table at 0x%llx (entry addr: 0x%llx)",
               reinterpret_cast<uintptr_t>(new_table), addr);
         }
 
@@ -775,38 +810,57 @@ namespace mem {
     const size_t aligned_size = (size + page_mask) & ~page_mask;
     const size_t page_count = aligned_size >> PAGE_SHIFT;
 
-    log("INFO", "searching for space of size 0x%llx (%d pages)", aligned_size, page_count);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] allocate_between_modules: enter pid=%u size=0x%llx\n",
+               target_pid, (unsigned long long)aligned_size);
 
     PEPROCESS target_process = nullptr;
     if (globals::ps_lookup_process_by_process_id(reinterpret_cast<HANDLE>(target_pid),
                                                  &target_process) != STATUS_SUCCESS) {
-      log("ERROR", "failed to lookup target process");
+      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                 "[INJECTOR] allocate_between_modules: ps_lookup failed\n");
       return nullptr;
     }
 
-    // RAII will handle cleanup
     raii::process_ref process_ref(target_process, "EPROCESS");
 
     const auto target_dir_base = physical::get_process_directory_base(target_process);
     if (!target_dir_base) {
-      log("ERROR", "failed to lookup target process directory base");
+      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                 "[INJECTOR] allocate_between_modules: dir_base = 0\n");
       return nullptr;
     }
 
     PPEB peb_address = globals::ps_get_process_peb(target_process);
     if (!peb_address) {
-      log("ERROR", "failed to get PEB address");
+      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                 "[INJECTOR] allocate_between_modules: PsGetProcessPeb returned NULL\n");
       return nullptr;
     }
 
-    PEB peb;
-    physical::read_process_memory(target_process, reinterpret_cast<uintptr_t>(peb_address), &peb,
-                                  sizeof(PEB));
-    log("INFO", "PEB found at 0x%llx", peb_address);
+    // Always-zero scratch + status-checked reads.  The previous code ignored
+    // the NTSTATUS return — so if the PEB read failed, we'd walk a list of
+    // uninitialised stack garbage and eventually deref a junk pointer (which
+    // is exactly the c0000005 / second-chance AV we hit on alloc_mode=1).
+    PEB peb = {};
+    NTSTATUS rst = physical::read_process_memory(
+        target_process, reinterpret_cast<uintptr_t>(peb_address),
+        &peb, sizeof(PEB));
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] allocate_between_modules: read PEB at %p st=0x%X "
+               "Ldr=%p\n",
+               peb_address, rst, peb.Ldr);
+    if (!NT_SUCCESS(rst) || !peb.Ldr) return nullptr;
 
-    PEB_LDR_DATA ldr_data;
-    physical::read_process_memory(target_process, reinterpret_cast<uintptr_t>(peb.Ldr), &ldr_data,
-                                  sizeof(PEB_LDR_DATA));
+    PEB_LDR_DATA ldr_data = {};
+    rst = physical::read_process_memory(
+        target_process, reinterpret_cast<uintptr_t>(peb.Ldr),
+        &ldr_data, sizeof(PEB_LDR_DATA));
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+               "[INJECTOR] allocate_between_modules: read LDR at %p st=0x%X "
+               "InMemFlink=%p\n",
+               peb.Ldr, rst, ldr_data.InMemoryOrderModuleList.Flink);
+    if (!NT_SUCCESS(rst) || !ldr_data.InMemoryOrderModuleList.Flink) return nullptr;
 
     PLIST_ENTRY current_entry = ldr_data.InMemoryOrderModuleList.Flink;
     PLIST_ENTRY first_entry = current_entry;
@@ -815,12 +869,33 @@ namespace mem {
     uintptr_t last_module_end = 0;
     int module_count = 0;
 
+    // Hard cap iterations so a corrupted Flink chain can't loop forever.
+    int max_iters = 512;
+
     do {
-      LDR_DATA_TABLE_ENTRY entry;
-      physical::read_process_memory(target_process,
-                                    reinterpret_cast<uintptr_t>(CONTAINING_RECORD(
-                                        current_entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)),
-                                    &entry, sizeof(LDR_DATA_TABLE_ENTRY));
+      if (--max_iters <= 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] allocate_between_modules: iteration cap hit, "
+                   "bailing — Flink chain appears corrupt\n");
+        return nullptr;
+      }
+      if (!current_entry) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] allocate_between_modules: current_entry NULL\n");
+        return nullptr;
+      }
+      LDR_DATA_TABLE_ENTRY entry = {};
+      uintptr_t entry_va = reinterpret_cast<uintptr_t>(CONTAINING_RECORD(
+          current_entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks));
+      NTSTATUS est = physical::read_process_memory(
+          target_process, entry_va, &entry, sizeof(LDR_DATA_TABLE_ENTRY));
+      if (!NT_SUCCESS(est)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                   "[INJECTOR] allocate_between_modules: read LDR_ENTRY at "
+                   "%p failed st=0x%X — bailing\n",
+                   (PVOID)entry_va, est);
+        return nullptr;
+      }
 
       if (entry.DllBase && (entry.Flags & 0x00000004)) {
         uintptr_t current_module_start = reinterpret_cast<uintptr_t>(entry.DllBase);

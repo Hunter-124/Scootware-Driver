@@ -1651,8 +1651,8 @@ static EX_RUNDOWN_REF g_ipc_rundown;
 static PETHREAD g_worker_threads[IPC_WORKER_COUNT] = {NULL};
 static PETHREAD g_discovery_thread = NULL;
 
-// Code cave descriptor — populated during DriverEntry by CreateSpoofedSystemThread.
-// Referenced by the CMD_STEALTH_STATUS, CMD_CAVE_INFO, and CMD_THREAD_VALIDATE handlers.
+// Code cave descriptor — populated during DriverEntry by FindAndPatchAnyCave.
+// Referenced by the CMD_STEALTH_STATUS and CMD_THREAD_VALIDATE handlers.
 CODE_CAVE g_thread_cave = {};
 
 // ---------------------------------------------------------------------------
@@ -2391,54 +2391,9 @@ PVOID g_ret_gadget_ntos = NULL;
 static volatile UINT32 g_handoff_pid    = 0;   // cheat's Windows PID
 static volatile UINT64 g_handoff_ipc_va = 0;   // VA of IPC_MEMORY in cheat's AS
 
-// Forward declaration — ipc_worker_thread is defined below
-// (process_ipc_command_slot needs to report its VA in CMD_CAVE_STEP_* results).
+// Forward declaration — ipc_worker_thread is defined below and referenced
+// in DriverEntry (FindAndPatchAnyCave target) before the definition appears.
 static VOID ipc_worker_thread(PVOID context);
-
-// ─── Cave step-debug state (CMD_CAVE_STEP_*) ────────────────────────────────
-// Auto-spoofing in DriverEntry is deferred so the driver always loads.  The
-// GUI walks the cave/KCFG/spawn pipeline one step at a time so we can isolate
-// which stage BSODs on baremetal (where we have no debug visibility).
-
-// Modules the SCAN step can probe.  Keep aligned with module_index in
-// IPC_CAVE_STEP_CMD.
-static const char* g_cave_step_modules[] = {
-    "ntoskrnl.exe",   // 0
-    "hal.dll",        // 1
-    "CI.dll",         // 2
-    "fltmgr.sys",     // 3
-};
-static constexpr UINT32 g_cave_step_module_count =
-    sizeof(g_cave_step_modules) / sizeof(g_cave_step_modules[0]);
-
-// Signals from the test thread back to CMD_CAVE_STEP_SPAWN.  Volatile +
-// Interlocked because the writer runs on a different thread than the reader.
-static volatile LONG g_cave_test_ran  = 0;   // 1 = test target was entered
-static volatile LONG g_cave_test_exit = 0;   // 1 = test target reached its RET
-
-//
-// cave_step_test_target — short-lived KSTART_ROUTINE used by CMD_CAVE_STEP_SPAWN.
-//
-// We deliberately do NOT redirect the cave's JMP to ipc_worker_thread for the
-// SPAWN test, because that would create an orphan worker that loops forever
-// (it doesn't observe g_ipc_thread_running until set by DriverEntry's normal
-// path).  Instead this target sets g_cave_test_ran, sleeps briefly so the
-// SPAWN handler can observe "alive" status, sets g_cave_test_exit, and
-// returns — letting PspSystemThreadStartup tear the thread down cleanly.
-//
-// If the BSOD reproduces during this thread's lifetime, the user knows it's
-// in the dispatch path (CET shadow stack, /GS cookie, alignment) and not in
-// the cave-write or KCFG-flip steps.
-//
-static VOID cave_step_test_target(PVOID context) {
-    UNREFERENCED_PARAMETER(context);
-    InterlockedExchange(&g_cave_test_ran, 1);
-    // 100 ms — long enough that the SPAWN handler's default 50 ms wait
-    // observes "alive", short enough that the thread is gone by next test.
-    LARGE_INTEGER delay; delay.QuadPart = -10000LL * 100;
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-    InterlockedExchange(&g_cave_test_exit, 1);
-}
 
 static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
   PIPC_SLOT slot = &mem->slots[slot_idx];
@@ -2646,51 +2601,143 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     UINT32 dll_size  = slot->cmd_data.inject.dll_size;
     UINT32 alloc_mode = slot->cmd_data.inject.alloc_mode;
 
-    if (!target_p || !dll_size || dll_size > MM_MAX_DLL_SIZE)
+    DbgPrintEx(0x4d, 0xffffffff,
+               "[CR3-IPC] CMD_INJECT_DLL: entry target_pid=%u dll_size=%u "
+               "alloc_mode=%u dll_usermode_ptr=%p\n",
+               target_p, dll_size, alloc_mode,
+               (PVOID)slot->cmd_data.inject.dll_usermode_ptr);
+
+    if (!injector_is_ready()) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: rejected — injector not "
+                 "initialized (critical pointers missing on this kernel)\n");
       break;
+    }
+
+    if (!target_p || !dll_size || dll_size > MM_MAX_DLL_SIZE) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: rejected invalid args\n");
+      break;
+    }
 
     PVOID kernel_dll = ExAllocatePool2(POOL_FLAG_NON_PAGED, dll_size, 'tJnI');
     if (!kernel_dll)
       break;
 
-    NTSTATUS read_st = read_process_memory(
-        g_test_process,
-        slot->cmd_data.inject.dll_usermode_ptr,
-        kernel_dll,
-        dll_size);
+    // Wrap the entire injection path in SEH so any access violation in the
+    // PT-injector subsystem (corrupt PE parse, bad VA in target, unresolved
+    // import, etc.) returns a clean failure to the client instead of bug-
+    // checking the box.  SEH does NOT catch /GS stack-cookie failures —
+    // those route through __report_gsfailure → KeBugCheckEx — but it shields
+    // every other class of in-flight kernel-mode exception.
+    NTSTATUS read_st = STATUS_UNSUCCESSFUL;
+    __try {
+      read_st = read_process_memory(
+          g_test_process,
+          slot->cmd_data.inject.dll_usermode_ptr,
+          kernel_dll,
+          dll_size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      read_st = GetExceptionCode();
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: read_process_memory raised 0x%X\n",
+                 read_st);
+    }
 
     if (!NT_SUCCESS(read_st)) {
       ExFreePool(kernel_dll);
       break;
     }
 
-    PVOID  remote_base = NULL;
-    UINT32 local_pid   = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
-    NTSTATUS alloc_st  = injector_stealth_alloc(local_pid, target_p, dll_size, alloc_mode, &remote_base);
-    if (!NT_SUCCESS(alloc_st) || !remote_base) {
-      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: stealth alloc failed 0x%X\n", alloc_st);
+    PVOID    remote_base  = NULL;
+    ULONG    entry_offset = 0;
+    UINT32   local_pid    = (UINT32)(ULONG_PTR)PsGetCurrentProcessId();
+
+    // ── Parse PE headers to get SizeOfImage ──────────────────────────────
+    // The client passes the on-disk DLL file size (e.g. 10752 bytes); we
+    // can't size the stealth allocation off that because the in-memory
+    // layout (SectionAlignment = 0x1000) is almost always larger than the
+    // file layout (FileAlignment = 0x200).  Allocating file_size bytes
+    // means sections past the file size have no backing PTE in the target
+    // — DllMain's .text/.rdata may sit there and a fetch is undefined,
+    // which is the "DLL doesn't load, no MessageBox" symptom.
+    ULONG image_size = 0;
+    __try {
+      if (dll_size >= sizeof(IMAGE_DOS_HEADER)) {
+        auto* pdos = (PIMAGE_DOS_HEADER)kernel_dll;
+        if (pdos->e_magic == IMAGE_DOS_SIGNATURE &&
+            (ULONG)pdos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) <= dll_size) {
+          auto* pnt = (PIMAGE_NT_HEADERS64)((PUCHAR)kernel_dll + pdos->e_lfanew);
+          if (pnt->Signature == IMAGE_NT_SIGNATURE &&
+              pnt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            image_size = pnt->OptionalHeader.SizeOfImage;
+          }
+        }
+      }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      image_size = 0;
+    }
+
+    if (!image_size) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: invalid PE — could not derive "
+                 "SizeOfImage from %u byte buffer\n", dll_size);
       ExFreePool(kernel_dll);
       break;
     }
+    DbgPrintEx(0x4d, 0xffffffff,
+               "[CR3-IPC] CMD_INJECT_DLL: file_size=%u  image_size=0x%X "
+               "(allocating image_size)\n", dll_size, image_size);
 
-    ULONG    entry_offset = 0;
-    NTSTATUS map_st = injector_map_dll_sections(target_p, remote_base, kernel_dll, dll_size, &entry_offset);
-    if (!NT_SUCCESS(map_st)) {
-      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: map sections failed 0x%X\n", map_st);
-      ExFreePool(kernel_dll);
-      break;
+    __try {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=stealth_alloc begin\n");
+      NTSTATUS alloc_st = injector_stealth_alloc(
+          local_pid, target_p, image_size, alloc_mode, &remote_base);
+      if (!NT_SUCCESS(alloc_st) || !remote_base) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CMD_INJECT_DLL: stealth alloc failed 0x%X\n", alloc_st);
+        __leave;
+      }
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=stealth_alloc OK remote_base=%p\n",
+                 remote_base);
+
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=map_dll_sections begin\n");
+      NTSTATUS map_st = injector_map_dll_sections(
+          target_p, remote_base, kernel_dll, dll_size, &entry_offset);
+      if (!NT_SUCCESS(map_st)) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CMD_INJECT_DLL: map sections failed 0x%X\n", map_st);
+        __leave;
+      }
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=map_dll_sections OK "
+                 "entry_offset=0x%X\n",
+                 entry_offset);
+
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=execute_dll begin\n");
+      NTSTATUS exec_st = injector_execute_dll(
+          local_pid, target_p, remote_base, entry_offset, alloc_mode);
+      if (!NT_SUCCESS(exec_st)) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CMD_INJECT_DLL: execute failed 0x%X\n", exec_st);
+        __leave;
+      }
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: stage=execute_dll OK — full success\n");
+
+      slot->cmd_data.result.result = (UINT64)remote_base;
+      final_status = STATUS_IPC_SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CMD_INJECT_DLL: SEH caught exception 0x%X — bailing\n",
+                 GetExceptionCode());
     }
 
     ExFreePool(kernel_dll);
-
-    NTSTATUS exec_st = injector_execute_dll(local_pid, target_p, remote_base, entry_offset, alloc_mode);
-    if (!NT_SUCCESS(exec_st)) {
-      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] CMD_INJECT_DLL: execute failed 0x%X\n", exec_st);
-      break;
-    }
-
-    slot->cmd_data.result.result = (UINT64)remote_base;
-    final_status = STATUS_IPC_SUCCESS;
     break;
   }
 
@@ -3243,468 +3290,6 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
 
     r->result = found ? 1 : 0;
     ExFreePool(pMods);
-    final_status = STATUS_IPC_SUCCESS;
-    break;
-  }
-
-  // ─── Cave step-debugging handlers ────────────────────────────────────
-  // Each handler does ONE stage of the spoofing pipeline and writes a fully
-  // populated IPC_CAVE_STEP_RESULT to slot->data_buffer.  Wrapped in __try
-  // so an SEH-able fault is captured as STATUS_IPC_ERROR rather than
-  // bugchecking — the bare-metal BSODs are the non-SEH kind (CET CP, /GS
-  // failure, etc.) which will still bring down the box, but the GUI will
-  // see WHICH step caused it because all earlier-step result blobs are
-  // already in the slot buffer when the next step is invoked.
-
-  case CMD_CAVE_STEP_SCAN: {
-    PIPC_CAVE_STEP_RESULT r =
-        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
-    RtlZeroMemory(r, sizeof(*r));
-    r->step_id = CMD_CAVE_STEP_SCAN;
-    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
-
-    UINT32 idx = slot->cmd_data.cave_step.module_index;
-    if (idx >= g_cave_step_module_count) {
-      r->ntstatus = (UINT32)STATUS_INVALID_PARAMETER;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-    const char* modName = g_cave_step_modules[idx];
-    SIZE_T mlen = 0; while (modName[mlen] && mlen < 31) mlen++;
-    RtlCopyMemory(r->scan_module_name, modName, mlen);
-    r->scan_module_name[mlen] = '\0';
-
-    extern CODE_CAVE g_thread_cave;
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
-    __try {
-      st = CodeCave::FindCodeCave(modName, &g_thread_cave);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      st = (NTSTATUS)GetExceptionCode();
-      RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
-    }
-    r->ntstatus = (UINT32)st;
-    if (NT_SUCCESS(st) && g_thread_cave.is_valid) {
-      // Stamp module_name into cave for downstream commands.
-      SIZE_T mn = 0; while (modName[mn] && mn < 63) {
-        g_thread_cave.module_name[mn] = modName[mn]; mn++;
-      }
-      g_thread_cave.module_name[mn] = '\0';
-
-      r->scan_module_base   = (UINT64)(ULONG_PTR)g_thread_cave.module_base;
-      PVOID textVA = nullptr; SIZE_T textSz = 0;
-      __try {
-        CodeCave::GetTextSectionRange(g_thread_cave.module_base, &textVA, &textSz);
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-      r->scan_text_start    = (UINT64)(ULONG_PTR)textVA;
-      r->scan_text_size     = (UINT64)textSz;
-      r->scan_cave_address  = (UINT64)(ULONG_PTR)g_thread_cave.cave_address;
-      r->scan_cave_size     = (UINT64)g_thread_cave.cave_size;
-      r->scan_aligned       = (((ULONG_PTR)g_thread_cave.cave_address & 0xF) == 0) ? 1u : 0u;
-      final_status = STATUS_IPC_SUCCESS;
-    } else {
-      final_status = STATUS_IPC_ERROR;
-    }
-    break;
-  }
-
-  case CMD_CAVE_STEP_PATCH: {
-    PIPC_CAVE_STEP_RESULT r =
-        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
-    RtlZeroMemory(r, sizeof(*r));
-    r->step_id = CMD_CAVE_STEP_PATCH;
-    // Patch target = cave_step_test_target.  Production auto-init (when
-    // re-enabled) uses ipc_worker_thread instead; the step-debug pipeline
-    // uses the short-lived test target so SPAWN doesn't orphan workers.
-    PVOID target = (PVOID)&cave_step_test_target;
-    r->worker_function_va = (UINT64)(ULONG_PTR)target;
-
-    extern CODE_CAVE g_thread_cave;
-    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
-      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-
-    // Snapshot current bytes (for the "before" picture) into r->patch_bytes
-    // temporarily — overwritten by the post-patch read below.
-    SIZE_T copyN = (g_thread_cave.cave_size < 18) ?
-                   g_thread_cave.cave_size : 18;
-    __try {
-      RtlCopyMemory(r->patch_bytes, g_thread_cave.cave_address, copyN);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
-    __try {
-      st = CodeCave::PatchCaveWithJump(&g_thread_cave, target);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      st = (NTSTATUS)GetExceptionCode();
-    }
-    r->ntstatus = (UINT32)st;
-    if (NT_SUCCESS(st)) {
-      // Recompute disp / variant — mirror the logic in PatchCaveWithJump
-      // so the user sees what was actually applied.
-      ULONG_PTR caveVa = (ULONG_PTR)g_thread_cave.cave_address;
-      ULONG_PTR jmpVa  = caveVa + 4;
-      ULONG_PTR tgtVa  = (ULONG_PTR)target;
-      INT64 disp64 = (INT64)(tgtVa - (jmpVa + 5));
-      r->patch_disp = disp64;
-      if (disp64 >= (INT64)INT32_MIN && disp64 <= (INT64)INT32_MAX) {
-        r->patch_used_rel32 = 1;
-        r->patch_size = 9;
-      } else {
-        r->patch_used_rel32 = 0;
-        r->patch_size = 18;
-      }
-      __try {
-        RtlCopyMemory(r->patch_bytes, g_thread_cave.cave_address, r->patch_size);
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-      final_status = STATUS_IPC_SUCCESS;
-    } else {
-      final_status = STATUS_IPC_ERROR;
-    }
-    break;
-  }
-
-  case CMD_CAVE_STEP_KCFG_RESOLVE: {
-    PIPC_CAVE_STEP_RESULT r =
-        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
-    RtlZeroMemory(r, sizeof(*r));
-    r->step_id = CMD_CAVE_STEP_KCFG_RESOLVE;
-    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
-
-    // Reset the one-shot cache so re-tries after a driver fix pick up
-    // the new code path (Load Config lookup, etc.).
-    KcfgPatch::ResetResolveCache();
-
-    KcfgPatch::CFG_RESOLVE info = {};
-    __try {
-      info = KcfgPatch::Resolve();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      r->ntstatus = (UINT32)GetExceptionCode();
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-    r->kcfg_fptr_loc         = (UINT64)(ULONG_PTR)info.fptr_loc;
-    r->kcfg_fptr_value       = (UINT64)(ULONG_PTR)info.fptr_value;
-    r->kcfg_nop_func         = (UINT64)(ULONG_PTR)info.nop_func;
-    r->kcfg_active           = info.kcfg_active ? 1u : 0u;
-    r->kcfg_bitmap_base_loc  = (UINT64)(ULONG_PTR)info.bitmap_base_loc;
-    r->kcfg_bitmap_base      = (UINT64)(ULONG_PTR)info.bitmap_base;
-
-    // Dump the dispatch function prologue (first 16 bytes) for diagnostics.
-    if (info.fptr_value && MmIsAddressValid(info.fptr_value)) {
-      __try {
-        RtlCopyMemory(r->kcfg_dispatch_prologue, info.fptr_value, 16);
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    if (!info.valid) {
-      r->kcfg_layout_valid = 0;
-      r->ntstatus = (UINT32)STATUS_NOT_FOUND;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-
-    // Probe known-valid exports and read their bitmap bits.
-    static const char* probes[4] = {
-      "PsCreateSystemThread",
-      "ExAllocatePool2",
-      "KeQueryActiveProcessorCountEx",
-      "MmGetSystemRoutineAddress",
-    };
-    PVOID ntos = GetSystemModuleBase("ntoskrnl.exe");
-
-    if (!info.kcfg_active) {
-      // CFG is inactive (NOP stub, bitmap NULL, or debugger attached).
-      // Probing the bitmap is meaningless — fill names/addrs for display
-      // but mark bits as "not checked" (0xFE).
-      for (int p = 0; p < 4; p++) {
-        SIZE_T nn = 0; while (probes[p][nn] && nn < 23) {
-          r->kcfg_probe_names[p][nn] = probes[p][nn]; nn++;
-        }
-        r->kcfg_probe_names[p][nn] = '\0';
-        PVOID exp = ntos ? KcfgPatch::FindExport(ntos, probes[p]) : nullptr;
-        r->kcfg_probe_addrs[p] = (UINT64)(ULONG_PTR)exp;
-        r->kcfg_probe_bits[p] = 0xFE;  // "not checked — CFG inactive"
-      }
-      r->kcfg_layout_valid = 2;  // 2 = N/A (CFG inactive, no bitmap)
-      r->ntstatus = (UINT32)STATUS_SUCCESS;
-      final_status = STATUS_IPC_SUCCESS;
-      break;
-    }
-
-    // CFG IS active — probe the bitmap for known-valid exports.
-    BOOLEAN anySet = FALSE;
-    for (int p = 0; p < 4; p++) {
-      SIZE_T nn = 0; while (probes[p][nn] && nn < 23) {
-        r->kcfg_probe_names[p][nn] = probes[p][nn]; nn++;
-      }
-      r->kcfg_probe_names[p][nn] = '\0';
-
-      PVOID exp = ntos ? KcfgPatch::FindExport(ntos, probes[p]) : nullptr;
-      r->kcfg_probe_addrs[p] = (UINT64)(ULONG_PTR)exp;
-      if (!exp || !info.bitmap_base) {
-        r->kcfg_probe_bits[p] = 0xFF;
-        continue;
-      }
-      __try {
-        int b = KcfgPatch::ReadBit(info.bitmap_base, (ULONG_PTR)exp);
-        r->kcfg_probe_bits[p] = (b < 0) ? 0xFF : (UINT8)b;
-        if (b == 1) anySet = TRUE;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        r->kcfg_probe_bits[p] = 0xFF;
-      }
-    }
-    r->kcfg_layout_valid = anySet ? 1u : 0u;
-    r->ntstatus = (UINT32)STATUS_SUCCESS;
-    final_status = STATUS_IPC_SUCCESS;
-    break;
-  }
-
-  case CMD_CAVE_STEP_KCFG_PATCH: {
-    PIPC_CAVE_STEP_RESULT r =
-        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
-    RtlZeroMemory(r, sizeof(*r));
-    r->step_id = CMD_CAVE_STEP_KCFG_PATCH;
-    r->worker_function_va = (UINT64)(ULONG_PTR)ipc_worker_thread;
-
-    extern CODE_CAVE g_thread_cave;
-    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
-      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-    r->kcfg_target_addr = (UINT64)(ULONG_PTR)g_thread_cave.cave_address;
-
-    // Read byte_before
-    KcfgPatch::CFG_RESOLVE info = KcfgPatch::Resolve();
-    if (info.valid && info.bitmap_base) {
-      ULONG_PTR bo; ULONG bb;
-      KcfgPatch::ComputeBitPos((ULONG_PTR)g_thread_cave.cave_address, &bo, &bb);
-      r->kcfg_byte_offset = (UINT64)bo;
-      r->kcfg_bit_in_byte = bb;
-      PUCHAR ba = (PUCHAR)info.bitmap_base + bo;
-      r->kcfg_byte_addr = (UINT64)(ULONG_PTR)ba;
-      __try {
-        if (MmIsAddressValid(ba)) r->kcfg_byte_before = *ba;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
-    __try {
-      st = KcfgPatch::MarkValidCallTarget(g_thread_cave.cave_address);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      st = (NTSTATUS)GetExceptionCode();
-    }
-    r->ntstatus = (UINT32)st;
-
-    // Read byte_after
-    if (info.valid && info.bitmap_base && r->kcfg_byte_addr) {
-      __try {
-        if (MmIsAddressValid((PVOID)(ULONG_PTR)r->kcfg_byte_addr))
-          r->kcfg_byte_after = *(PUCHAR)(ULONG_PTR)r->kcfg_byte_addr;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    final_status = NT_SUCCESS(st) ? STATUS_IPC_SUCCESS : STATUS_IPC_ERROR;
-    break;
-  }
-
-  case CMD_CAVE_STEP_SPAWN: {
-    PIPC_CAVE_STEP_RESULT r =
-        (PIPC_CAVE_STEP_RESULT)slot->data_buffer;
-    RtlZeroMemory(r, sizeof(*r));
-    r->step_id = CMD_CAVE_STEP_SPAWN;
-    r->worker_function_va = (UINT64)(ULONG_PTR)&cave_step_test_target;
-
-    extern CODE_CAVE g_thread_cave;
-    if (!g_thread_cave.is_valid || !g_thread_cave.cave_address) {
-      r->ntstatus = (UINT32)STATUS_INVALID_DEVICE_STATE;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-
-    // ─── Pre-flight: verify the cave still contains our patch ──────────
-    // Guards against PatchGuard/CI reverting the bytes between PATCH and
-    // SPAWN steps, and confirms the embedded target address is correct.
-    PUCHAR caveBytes = (PUCHAR)g_thread_cave.cave_address;
-    __try {
-      RtlCopyMemory(r->spawn_cave_verify, caveBytes, 8);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    if (caveBytes[0] != 0xF3 || caveBytes[1] != 0x0F ||
-        caveBytes[2] != 0x1E || caveBytes[3] != 0xFA) {
-      DbgPrintEx(0x4d, 0xffffffff,
-                 "[CR3-IPC] SPAWN: cave ENDBR64 missing — patch reverted?\n");
-      r->ntstatus = (UINT32)STATUS_INVALID_IMAGE_FORMAT;
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-
-    // For abs64 form (FF 25 00 00 00 00 + 8-byte target), verify the
-    // embedded target matches cave_step_test_target.
-    if (caveBytes[4] == 0xFF && caveBytes[5] == 0x25) {
-      ULONG_PTR embeddedTarget = 0;
-      __try {
-        RtlCopyMemory(&embeddedTarget, &caveBytes[10], sizeof(ULONG_PTR));
-      } __except (EXCEPTION_EXECUTE_HANDLER) {}
-      r->spawn_embedded_target = (UINT64)embeddedTarget;
-      if (embeddedTarget != (ULONG_PTR)&cave_step_test_target) {
-        DbgPrintEx(0x4d, 0xffffffff,
-                   "[CR3-IPC] SPAWN: embedded target %p != test_target %p\n",
-                   (PVOID)embeddedTarget, &cave_step_test_target);
-        r->ntstatus = (UINT32)STATUS_INVALID_ADDRESS;
-        final_status = STATUS_IPC_ERROR;
-        break;
-      }
-    } else if (caveBytes[4] == 0xE9) {
-      // rel32 form — compute effective target for diagnostics.
-      INT32 disp = 0;
-      __try { RtlCopyMemory(&disp, &caveBytes[5], 4); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-      ULONG_PTR effectiveTarget = (ULONG_PTR)caveBytes + 4 + 5 + (INT64)disp;
-      r->spawn_embedded_target = (UINT64)effectiveTarget;
-      if (effectiveTarget != (ULONG_PTR)&cave_step_test_target) {
-        DbgPrintEx(0x4d, 0xffffffff,
-                   "[CR3-IPC] SPAWN: rel32 target %p != test_target %p\n",
-                   (PVOID)effectiveTarget, &cave_step_test_target);
-        r->ntstatus = (UINT32)STATUS_INVALID_ADDRESS;
-        final_status = STATUS_IPC_ERROR;
-        break;
-      }
-    }
-
-    InterlockedExchange(&g_cave_test_ran, 0);
-    InterlockedExchange(&g_cave_test_exit, 0);
-
-    DbgPrintEx(0x4d, 0xffffffff,
-               "[CR3-IPC] SPAWN: creating thread — cave=%p target=%p\n",
-               g_thread_cave.cave_address, &cave_step_test_target);
-
-    HANDLE hT = NULL;
-    NTSTATUS st = STATUS_UNSUCCESSFUL;
-    __try {
-      st = PsCreateSystemThread(
-          &hT, THREAD_ALL_ACCESS, NULL, NULL, NULL,
-          (PKSTART_ROUTINE)g_thread_cave.cave_address,
-          NULL);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      st = (NTSTATUS)GetExceptionCode();
-    }
-    r->spawn_create_status = (UINT32)st;
-    r->ntstatus = (UINT32)st;
-
-    if (!NT_SUCCESS(st)) {
-      DbgPrintEx(0x4d, 0xffffffff,
-                 "[CR3-IPC] SPAWN: PsCreateSystemThread failed 0x%X\n", st);
-      final_status = STATUS_IPC_ERROR;
-      break;
-    }
-
-    r->spawn_thread_handle = (UINT64)(ULONG_PTR)hT;
-    PETHREAD pT = NULL;
-    __try {
-      if (NT_SUCCESS(ObReferenceObjectByHandle(
-              hT, THREAD_ALL_ACCESS, NULL, KernelMode,
-              (PVOID*)&pT, NULL))) {
-        r->spawn_thread_object = (UINT64)(ULONG_PTR)pT;
-      }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    // Wait for the test thread to run.  Use at least 200 ms — 50 ms is
-    // too short on systems with many CPUs or high load; the thread may
-    // not have been scheduled yet.
-    UINT32 waitMs = slot->cmd_data.cave_step.spawn_wait_ms;
-    if (waitMs == 0) waitMs = 200;
-    if (waitMs > 5000) waitMs = 5000;
-    LARGE_INTEGER delay; delay.QuadPart = -10000LL * (LONGLONG)waitMs;
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
-    // Check if the thread has already terminated (crashed or returned).
-    BOOLEAN threadTerminated = FALSE;
-    if (pT) {
-      LARGE_INTEGER zeroTimeout; zeroTimeout.QuadPart = 0;
-      NTSTATUS waitSt = KeWaitForSingleObject(
-          pT, Executive, KernelMode, FALSE, &zeroTimeout);
-      threadTerminated = (waitSt == STATUS_SUCCESS);
-    }
-
-    LONG testRan  = InterlockedCompareExchange(&g_cave_test_ran, 0, 0);
-    LONG testExit = InterlockedCompareExchange(&g_cave_test_exit, 0, 0);
-
-    r->spawn_test_ran = (UINT32)testRan;
-
-    if (threadTerminated && testRan == 0) {
-      // Thread terminated but never reached cave_step_test_target's
-      // first line.  The JMP dispatch itself crashed (CFG, CET, bad
-      // address, or an access violation in the trampoline).
-      r->spawn_alive = 0;
-      r->spawn_exit_status = 0xDEAD0001; // sentinel: dispatch crash
-      DbgPrintEx(0x4d, 0xffffffff,
-                 "[CR3-IPC] SPAWN: thread CRASHED before reaching test target "
-                 "(terminated=%d, ran=%d, exit=%d)\n",
-                 threadTerminated, testRan, testExit);
-    } else if (threadTerminated && testRan == 1) {
-      // Thread ran AND exited cleanly.  This is success.
-      r->spawn_alive = 0;
-      r->spawn_exit_status = 0;
-      DbgPrintEx(0x4d, 0xffffffff,
-                 "[CR3-IPC] SPAWN: thread ran and exited cleanly\n");
-    } else {
-      // Thread still alive (hasn't terminated yet).
-      r->spawn_alive = 1;
-      r->spawn_exit_status = 0;
-      DbgPrintEx(0x4d, 0xffffffff,
-                 "[CR3-IPC] SPAWN: thread alive — ran=%d exit=%d\n",
-                 testRan, testExit);
-    }
-
-    if (pT) ObDereferenceObject(pT);
-    ZwClose(hT);
-    final_status = STATUS_IPC_SUCCESS;
-    break;
-  }
-
-  case CMD_CAVE_INFO: {
-    extern CODE_CAVE g_thread_cave;
-    char* report = (char*)slot->data_buffer;
-    RtlZeroMemory(report, IPC_SLOT_DATA_SIZE);
-    SIZE_T pos2 = 0;
-    auto a = [&](const char* s) {
-        while (pos2 < IPC_SLOT_DATA_SIZE - 1 && *s) report[pos2++] = *s++;
-        report[pos2] = '\0';
-    };
-    auto ahex = [&](ULONG_PTR val) {
-        static const char h[] = "0123456789ABCDEF";
-        char b[19]; int i = 17; b[18] = '\0';
-        ULONG_PTR v = val;
-        do { b[i--] = h[v & 0xF]; v >>= 4; } while (v);
-        b[i--] = 'x'; b[i] = '0'; a(b + i);
-    };
-    auto abyte = [&](UINT8 byte) {
-        static const char h[] = "0123456789ABCDEF";
-        if (pos2 + 2 < IPC_SLOT_DATA_SIZE - 1) {
-            report[pos2++] = h[byte >> 4];
-            report[pos2++] = h[byte & 0xF];
-            report[pos2] = '\0';
-        }
-    };
-    if (g_thread_cave.is_valid) {
-        a("Cave Found: YES\nCave Address: ");
-        ahex((ULONG_PTR)g_thread_cave.cave_address);
-        a("\nCave Size: ");
-        { SIZE_T sz = g_thread_cave.cave_size; char tmp[21]; int j = 19; tmp[20] = '\0';
-          do { tmp[j--] = (char)('0' + (sz % 10)); sz /= 10; } while (sz); a(tmp + j + 1); }
-        a(" bytes\nPatch[0..4]: ");
-        if (g_thread_cave.cave_size >= 1) { abyte(((PUCHAR)g_thread_cave.cave_address)[0]); a(" "); }
-        if (g_thread_cave.cave_size >= 2) { abyte(((PUCHAR)g_thread_cave.cave_address)[1]); a(" "); }
-        if (g_thread_cave.cave_size >= 3) { abyte(((PUCHAR)g_thread_cave.cave_address)[2]); a(" "); }
-        if (g_thread_cave.cave_size >= 4) { abyte(((PUCHAR)g_thread_cave.cave_address)[3]); a(" "); }
-        if (g_thread_cave.cave_size >= 5) { abyte(((PUCHAR)g_thread_cave.cave_address)[4]); }
-        a("\nSTATUS: Thread start address SPOOFED\n");
-    } else {
-        a("Cave Found: NO\nSTATUS: Thread start address NOT spoofed!\n");
-    }
-    SIZE_T endPos2 = (pos2 < IPC_SLOT_DATA_SIZE - 1) ? pos2 : (IPC_SLOT_DATA_SIZE - 1);
-    report[endPos2] = '\0';
     final_status = STATUS_IPC_SUCCESS;
     break;
   }
@@ -4438,8 +4023,43 @@ static VOID ipc_discovery_thread(PVOID context) {
   PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+// ── pdata / SEH unwinder support ────────────────────────────────────────────
+// RUNTIME_FUNCTION isn't reliably declared in the kernel WDK headers we
+// include, so define the x64 layout locally.  Same layout as winnt.h.
+typedef struct _CR3_RUNTIME_FUNCTION {
+  ULONG BeginAddress;
+  ULONG EndAddress;
+  ULONG UnwindInfoAddress;
+} CR3_RUNTIME_FUNCTION, *PCR3_RUNTIME_FUNCTION;
+
+typedef BOOLEAN (NTAPI *RtlAddFunctionTable_t)(
+    PCR3_RUNTIME_FUNCTION FunctionTable, DWORD EntryCount, DWORD64 BaseAddress);
+typedef BOOLEAN (NTAPI *RtlDeleteFunctionTable_t)(
+    PCR3_RUNTIME_FUNCTION FunctionTable);
+
+// Resolved dynamically in DriverEntry via MmGetSystemRoutineAddress — avoids
+// any static-link / dllimport / NTSYSAPI weirdness with the kernel headers.
+static RtlAddFunctionTable_t    g_RtlAddFunctionTable    = NULL;
+static RtlDeleteFunctionTable_t g_RtlDeleteFunctionTable = NULL;
+
+// Forward declarations for the pdata registration globals (defined further
+// below near DriverEntry).  unload_drv tears them down before our image
+// pages are freed so the SEH unwinder doesn't later consult a stale table.
+extern BOOLEAN              g_pdata_registered;
+extern PCR3_RUNTIME_FUNCTION g_pdata_table_va;
+
 void unload_drv(PDRIVER_OBJECT drv_obj) {
   UNREFERENCED_PARAMETER(drv_obj);
+
+  // Drop the RUNTIME_FUNCTION table we registered in DriverEntry before our
+  // image pages go away — otherwise the unwinder could later try to consult
+  // a freed table and crash the system.
+  if (g_pdata_registered && g_pdata_table_va && g_RtlDeleteFunctionTable) {
+    g_RtlDeleteFunctionTable(g_pdata_table_va);
+    g_pdata_registered = FALSE;
+    g_pdata_table_va = NULL;
+  }
+
   g_ipc_thread_running = FALSE;
   DbgPrintEx(0x4d, 0xffffffff,
              "[CR3-IPC] Supervisor: shutdown requested — draining threads\n");
@@ -4488,10 +4108,118 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   // (each call locks → maps → copies → unmaps → unlocks within scope).
   // CleanupProxyPage();
 
+  // Restore the code cave to 0xCC padding now that every thread that could
+  // have been executing from it has fully terminated (waited above).
+  // Check cave_address + patch_size rather than is_valid: if DriverEntry's
+  // verification block zeroed g_thread_cave after a successful patch (e.g.
+  // a transient read fault on the ENDBR64 check), is_valid would be FALSE
+  // while the cave bytes in ntoskrnl .text are still ENDBR64+JMP.
+  if (g_thread_cave.cave_address && g_thread_cave.patch_size > 0) {
+    g_thread_cave.is_valid = TRUE;  // ensure UnpatchCave's guard passes
+    NTSTATUS unpatch_st = CodeCave::UnpatchCave(&g_thread_cave);
+    DbgPrintEx(0x4d, 0xffffffff,
+               "[CR3-IPC] Supervisor: CodeCave::UnpatchCave returned 0x%X\n",
+               unpatch_st);
+  }
+  RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+
   // Clean up HWID spoofer (restores originals if active)
   HWIDSpoofer::Cleanup();
 
   DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Supervisor: shutdown complete\n");
+}
+
+// ---------------------------------------------------------------------------
+// Self-register our PE's RUNTIME_FUNCTION table (.pdata) with the kernel's
+// SEH unwinder.
+//
+// Background: when a KDU-style loader maps our PE into NonPagedPool and jumps
+// to DriverEntry, it does NOT register our .pdata with the OS.  The x64 SEH
+// unwinder walks the call stack via RUNTIME_FUNCTION entries looked up by
+// RIP — if a frame's RIP is in our driver's image and the unwinder cannot
+// find a matching entry, it falls back to scanning raw stack words for things
+// that look like return addresses.  Eventually it lands on some ntoskrnl
+// function with a /GS prologue, asks the /GS handler to verify the cookie at
+// the offset its unwind info declares, and the cookie of course doesn't
+// match — KeBugCheckEx(0xF7) with FAILURE_BUCKET 0xF7_MISSING_GSFRAME.
+//
+// What you see on the user side: any in-driver access violation produces a
+// /GS bugcheck instead of a clean STATUS_ACCESS_VIOLATION returned by SEH.
+//
+// Fix: walk our own PE during DriverEntry, find the .pdata section, and call
+// RtlAddFunctionTable.  Once registered, the unwinder finds correct frames
+// inside our driver, propagates exceptions to our __try/__except handlers,
+// and a corrupt PE / bad VA / null deref becomes a logged failure instead of
+// a BSOD.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+// Definitions matching the forward declarations near unload_drv.  Must NOT
+// be static so the externs at that site resolve at link time.
+BOOLEAN              g_pdata_registered = FALSE;
+PCR3_RUNTIME_FUNCTION g_pdata_table_va  = NULL;
+
+static void RegisterDriverPdata(void) {
+    // Resolve RtlAddFunctionTable / RtlDeleteFunctionTable dynamically.
+    {
+        UNICODE_STRING addName, delName;
+        RtlInitUnicodeString(&addName, L"RtlAddFunctionTable");
+        RtlInitUnicodeString(&delName, L"RtlDeleteFunctionTable");
+        g_RtlAddFunctionTable =
+            (RtlAddFunctionTable_t)MmGetSystemRoutineAddress(&addName);
+        g_RtlDeleteFunctionTable =
+            (RtlDeleteFunctionTable_t)MmGetSystemRoutineAddress(&delName);
+    }
+
+    if (!g_RtlAddFunctionTable) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: RtlAddFunctionTable not found — skipping\n");
+        return;
+    }
+
+    PVOID image_base = (PVOID)&__ImageBase;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)image_base;
+
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: bad MZ at %p — skipping\n", image_base);
+        return;
+    }
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUCHAR)image_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: bad PE at %p — skipping\n", image_base);
+        return;
+    }
+
+    // The .pdata RVA + size is in the EXCEPTION data directory (index 3).
+    IMAGE_DATA_DIRECTORY exc =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!exc.VirtualAddress || !exc.Size) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: no EXCEPTION directory — skipping\n");
+        return;
+    }
+
+    PCR3_RUNTIME_FUNCTION table =
+        (PCR3_RUNTIME_FUNCTION)((PUCHAR)image_base + exc.VirtualAddress);
+    DWORD entry_count = exc.Size / sizeof(CR3_RUNTIME_FUNCTION);
+
+    // Failure is non-fatal but logged: SEH unwinding through driver frames
+    // will continue to fall back to the stack-scanning path that produces
+    // MISSING_GSFRAME bugchecks on in-driver AVs.
+    BOOLEAN ok = g_RtlAddFunctionTable(table, entry_count, (DWORD64)image_base);
+    if (ok) {
+        g_pdata_registered = TRUE;
+        g_pdata_table_va = table;
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: registered %lu RUNTIME_FUNCTIONs at %p "
+                   "(image_base=%p)\n",
+                   entry_count, table, image_base);
+    } else {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] pdata: RtlAddFunctionTable failed — SEH may "
+                   "still BSOD with MISSING_GSFRAME on in-driver AVs\n");
+    }
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -4500,6 +4228,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   if (DriverObject) {
       DriverObject->DriverUnload = unload_drv;
   }
+
+  // Register our .pdata FIRST — before any other init step that might fault.
+  // If this succeeds, every subsequent __try/__except in the driver actually
+  // works for AVs inside our code.
+  RegisterDriverPdata();
 
   DbgPrintEx(0x4d, 0xffffffff,
              "[CR3-IPC] Driver entry called\n");
@@ -4603,22 +4336,64 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   __try {
     NTSTATUS cave_st = CodeCave::FindAndPatchAnyCave((PVOID)ipc_worker_thread, &g_thread_cave);
+    DbgPrintEx(0x4d, 0xffffffff,
+               "[CR3-IPC] CodeCave: FindAndPatchAnyCave returned st=0x%X, "
+               "g_thread_cave.is_valid=%d, cave_address=%p\n",
+               cave_st, g_thread_cave.is_valid, g_thread_cave.cave_address);
+    
     if (NT_SUCCESS(cave_st) && g_thread_cave.is_valid && g_thread_cave.cave_address) {
       DbgPrintEx(0x4d, 0xffffffff,
                  "[CR3-IPC] CodeCave: SUCCESS — found and patched cave at %p "
                  "(module: %p, size: %zu)\n",
                  g_thread_cave.cave_address, g_thread_cave.module_base, g_thread_cave.cave_size);
       
-      // Mark the cave address as a valid CFG call target
+      // Mark the cave address as a valid CFG call target (optional)
+      BOOLEAN kcfg_success = FALSE;
       __try {
         KcfgPatch::MarkValidCallTarget(g_thread_cave.cave_address);
         DbgPrintEx(0x4d, 0xffffffff,
                    "[CR3-IPC] CodeCave: KCFG bitmap updated for cave address %p\n",
                    g_thread_cave.cave_address);
+        kcfg_success = TRUE;
       } __except (EXCEPTION_EXECUTE_HANDLER) {
         DbgPrintEx(0x4d, 0xffffffff,
                    "[CR3-IPC] CodeCave: KCFG patch raised exception 0x%X — "
-                   "cave may not be CFG-valid, zeroing g_thread_cave\n",
+                   "cave may not be CFG-valid, continuing without KCFG\n",
+                   GetExceptionCode());
+        // Don't zero g_thread_cave - KCFG is optional
+        // Threads will still work, just might trigger CFG violations on some systems
+        kcfg_success = FALSE;
+      }
+      
+      // Verify the patch was actually applied (critical)
+      __try {
+        UINT8 patch_bytes[5];
+        RtlCopyMemory(patch_bytes, g_thread_cave.cave_address, 5);
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CodeCave: Patch verification: bytes[0..4] = "
+                   "%02X %02X %02X %02X %02X\n",
+                   patch_bytes[0], patch_bytes[1], patch_bytes[2], 
+                   patch_bytes[3], patch_bytes[4]);
+        
+        // Check for ENDBR64 prefix (F3 0F 1E FA) - required for CET/IBT
+        if (patch_bytes[0] == 0xF3 && patch_bytes[1] == 0x0F && 
+            patch_bytes[2] == 0x1E && patch_bytes[3] == 0xFA) {
+          DbgPrintEx(0x4d, 0xffffffff,
+                     "[CR3-IPC] CodeCave: Patch verification PASSED (ENDBR64 found)\n");
+          DbgPrintEx(0x4d, 0xffffffff,
+                     "[CR3-IPC] CodeCave: Auto-spoofing SUCCESSFUL — "
+                     "cave at %p, KCFG=%s\n",
+                     g_thread_cave.cave_address, kcfg_success ? "YES" : "NO");
+        } else {
+          DbgPrintEx(0x4d, 0xffffffff,
+                     "[CR3-IPC] CodeCave: Patch verification FAILED (no ENDBR64) — "
+                     "patch may have been reverted or overwritten, zeroing g_thread_cave\n");
+          RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+        }
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(0x4d, 0xffffffff,
+                   "[CR3-IPC] CodeCave: Patch verification raised exception 0x%X — "
+                   "cannot read cave memory, zeroing g_thread_cave\n",
                    GetExceptionCode());
         RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
       }
@@ -4626,7 +4401,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
       DbgPrintEx(0x4d, 0xffffffff,
                  "[CR3-IPC] CodeCave: FindAndPatchAnyCave failed (st=0x%X) — "
                  "falling back to non-spoofed thread creation\n", cave_st);
-      RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+      // Don't zero g_thread_cave here - it might have been partially set
+      // Let's check what state it's in
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] CodeCave: g_thread_cave state after failure: "
+                 "is_valid=%d, cave_address=%p, module_base=%p\n",
+                 g_thread_cave.is_valid, g_thread_cave.cave_address, g_thread_cave.module_base);
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     DbgPrintEx(0x4d, 0xffffffff,
@@ -4685,8 +4465,13 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
       startRoutine = g_thread_cave.cave_address;
       DbgPrintEx(0x4d, 0xffffffff,
                  "[CR3-IPC] Worker %d using spoofed start address %p "
-                 "(cave in %p)\n",
-                 i, startRoutine, g_thread_cave.module_base);
+                 "(cave in %p, is_valid=%d)\n",
+                 i, startRoutine, g_thread_cave.module_base, g_thread_cave.is_valid);
+    } else {
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] Worker %d using NON-spoofed start address %p "
+                 "(g_thread_cave.is_valid=%d, cave_address=%p)\n",
+                 i, startRoutine, g_thread_cave.is_valid, g_thread_cave.cave_address);
     }
     status = PsCreateSystemThread(&hWorker, THREAD_ALL_ACCESS, NULL, NULL, NULL,
                                   (PKSTART_ROUTINE)startRoutine,
@@ -4779,6 +4564,21 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 
     // Proxy-PTE state has been removed; nothing to tear down here.
     // CleanupProxyPage();
+
+    // Restore the code cave to 0xCC before the pool is freed.
+    // This MUST happen here (while pool pages are still live) so that
+    // the next driver load can find the same 0xCC run and re-patch it.
+    // unload_drv covers the V3 path; this covers V1 (manually-mapped).
+    if (g_thread_cave.cave_address && g_thread_cave.patch_size > 0) {
+      g_thread_cave.is_valid = TRUE;  // ensure UnpatchCave's guard passes
+      NTSTATUS unpatch_st = CodeCave::UnpatchCave(&g_thread_cave);
+      DbgPrintEx(0x4d, 0xffffffff,
+                 "[CR3-IPC] Supervisor (V1): CodeCave::UnpatchCave returned 0x%X\n",
+                 unpatch_st);
+    }
+    RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
+
+    HWIDSpoofer::Cleanup();
 
     DbgPrintEx(0x4d, 0xffffffff,
                "[CR3-IPC] Supervisor (V1): all threads exited — pool safe to "

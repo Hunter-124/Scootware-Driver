@@ -13,6 +13,13 @@
 // ntos_base: base address of ntoskrnl.exe (use GetSystemModuleBase("ntoskrnl")).
 NTSTATUS injector_init(PVOID ntos_base);
 
+// Returns TRUE only if injector_init succeeded and every critical function
+// pointer is non-NULL.  Callers MUST gate inject paths on this — a NULL
+// function-pointer call from kernel mode produces BSOD 0xF7 (the worker
+// stack frame's /GS cookie gets clobbered as control returns through the
+// exception unwinder).
+BOOLEAN injector_is_ready(void);
+
 // Allocate memory in a target process using the specified stealth mode.
 // out_remote_base receives the VA in the target process's address space.
 NTSTATUS injector_stealth_alloc(

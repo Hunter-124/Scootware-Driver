@@ -12,9 +12,14 @@ namespace page_table {
    * modifications.
    */
   auto flush_tlb() -> void {
-    globals::ke_flush_entire_tb(TRUE, TRUE);
-    globals::ke_invalidate_all_caches();
-    globals::mi_flush_entire_tb_due_to_attribute_change();
+    // The pattern-scanned undocumented helpers (ke_flush_entire_tb,
+    // ke_invalidate_all_caches, mi_flush_entire_tb_due_to_attribute_change)
+    // have signatures that drift between Windows builds.  Calling them with
+    // the wrong signature corrupts the caller's stack frame (manifests as
+    // DRIVER_OVERRAN_STACK_BUFFER 0xF7 / /GS cookie failure) and starves the
+    // DPC watchdog.  Skip them entirely — flush_caches handles per-page
+    // invalidation correctly with a local INVLPG.
+    _mm_mfence();
   }
 
   /**
@@ -47,14 +52,25 @@ namespace page_table {
    * @see Intel Software Developer Manual Vol 3A, Section 4.10 for TLB management
    */
   void flush_caches(void* address) {
+    // We are installing fresh PTEs for a virtual address that has never been
+    // accessed before (manual map into a previously-empty VA region).  No CPU
+    // has a TLB entry for this VA, so no system-wide shootdown is required —
+    // the first access on any CPU will TLB-miss and walk the new tables.
+    //
+    // The original implementation called three pattern-scanned undocumented
+    // helpers (KeFlushEntireTb, KeInvalidateAllCaches, KeFlushSingleTb) with
+    // signatures hand-typed in def.hpp.  When the real function on a given
+    // Windows build has a different arg count, the call reads garbage off
+    // the caller's stack and can write into the caller's /GS cookie slot,
+    // producing DRIVER_OVERRAN_STACK_BUFFER (0xF7) on function exit.  It
+    // also produces a system-wide IPI / wbinvd storm that hangs the box.
+    //
+    // A local mfence + INVLPG on the current core is sufficient and safe.
+    // We're called from inside mem::write_page_tables which runs at PASSIVE,
+    // so we INVLPG just to be tidy in case the address was somehow probed
+    // earlier on this core.
     _mm_mfence();
-
-    globals::ke_flush_entire_tb(TRUE, TRUE);  //  ( cr3/cr4 rewrite on all cores )
-    globals::ke_invalidate_all_caches();      // ( __wbinvd on all cores )
-    globals::ke_flush_single_tb(reinterpret_cast<uintptr_t>(address), 0,
-                                1);  // ( __invlpg on all cores )
-
-    _mm_mfence();
+    intrin::invlpg(address);
   }
 
   /**
