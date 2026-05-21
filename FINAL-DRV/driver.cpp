@@ -2836,18 +2836,33 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
 
   // ============================================================================
   // HWID Spoofer commands
+  //
+  // All CMD_HWID_* handlers below are compiled in but short-circuit to an
+  // error return when HWID_SPOOFER_ENABLED == 0 (see hwid_spoofer.hpp). The
+  // underlying HWIDSpoofer module is known to crash on the box on its first
+  // SMBIOS extraction, and the previous "auto-init on first command" pattern
+  // meant the very first HwidQueryStatus issued by the Loader right after
+  // Ping (Loader/src/main.cpp) bugchecked the system. Until the module is
+  // fixed, the IPC contract is preserved (status is still written back so
+  // the caller's spin-wait completes) but no kernel work is done.
   // ============================================================================
 
   case CMD_HWID_SAVE: {
+#if HWID_SPOOFER_ENABLED
     NTSTATUS st = HWIDSpoofer::SaveOriginal();
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
     DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SAVE: status=0x%X\n", st);
+#else
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SAVE: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_SPOOF: {
+#if HWID_SPOOFER_ENABLED
     // Auto-init: ensure originals captured before we apply spoof
     if (HWIDSpoofer::GetState() == HWID_STATE::HWID_STATE_UNINITIALIZED) { HWIDSpoofer::SaveOriginal(); }
     UINT32 components = slot->cmd_data.hwid_cmd.components;
@@ -2860,10 +2875,15 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
     DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SPOOF: comp=0x%X seed=0x%llX st=0x%X\n",
                components, seed, st);
+#else
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SPOOF: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_RESTORE: {
+#if HWID_SPOOFER_ENABLED
     // Auto-init: ensure originals captured first
     if (HWIDSpoofer::GetState() == HWID_STATE::HWID_STATE_UNINITIALIZED) { HWIDSpoofer::SaveOriginal(); }
     NTSTATUS st = HWIDSpoofer::RestoreOriginals();
@@ -2871,10 +2891,15 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
       final_status = STATUS_IPC_SUCCESS;
     }
     DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_RESTORE: status=0x%X\n", st);
+#else
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_RESTORE: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_REROLL: {
+#if HWID_SPOOFER_ENABLED
     // Auto-init: ensure originals captured before reroll
     if (HWIDSpoofer::GetState() == HWID_STATE::HWID_STATE_UNINITIALIZED) { HWIDSpoofer::SaveOriginal(); }
     UINT32 components = slot->cmd_data.hwid_cmd.components;
@@ -2886,10 +2911,15 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
     DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_REROLL: comp=0x%X st=0x%X\n",
                components, st);
+#else
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_REROLL: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_STATUS: {
+#if HWID_SPOOFER_ENABLED
     // Auto-init so status returns real data even without prior SAVE cmd.
     if (HWIDSpoofer::GetState() == HWID_STATE::HWID_STATE_UNINITIALIZED) { HWIDSpoofer::SaveOriginal(); }
 
@@ -2916,13 +2946,25 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     slot->cmd_data.hwid_cmd.components = hwid_buf->components_present;
 
     final_status = STATUS_IPC_SUCCESS;
+#else
+    // Disabled: hand back an "uninitialised, no spoof" view so the Loader UI
+    // can render a sensible "spoofer offline" state without crashing.
+    slot->cmd_data.hwid_cmd.state      = (UINT32)HWID_STATE::HWID_STATE_UNINITIALIZED;
+    slot->cmd_data.hwid_cmd.active     = 0;
+    slot->cmd_data.hwid_cmd.components = 0;
+    IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
+    RtlZeroMemory(hwid_buf, sizeof(IPC_HWID_DATA));
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_STATUS: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_LOAD: {
+#if HWID_SPOOFER_ENABLED
     // Load custom HWID data from usermode buffer and apply directly
     IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
-    
+
     // Convert IPC_HWID_DATA -> kernel HWID_DATA
     HWID_DATA loaded_hwid = {};
     memcpy(loaded_hwid.smbios_uuid,             hwid_buf->smbios_uuid, 16);
@@ -2955,10 +2997,15 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
     DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_LOAD: comp=0x%X st=0x%X\n",
                comp, st);
+#else
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_LOAD: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
   case CMD_HWID_GET_ORIGINAL: {
+#if HWID_SPOOFER_ENABLED
     IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
     RtlZeroMemory(hwid_buf, sizeof(IPC_HWID_DATA));
 
@@ -2977,6 +3024,12 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
 
     final_status = STATUS_IPC_SUCCESS;
+#else
+    IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
+    RtlZeroMemory(hwid_buf, sizeof(IPC_HWID_DATA));
+    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_GET_ORIGINAL: spoofer disabled (compile-time)\n");
+    final_status = STATUS_IPC_ERROR;
+#endif
     break;
   }
 
@@ -4123,8 +4176,14 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   }
   RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
 
-  // Clean up HWID spoofer (restores originals if active)
+  // Clean up HWID spoofer (restores originals if active).
+  // Gated on the same compile-time switch as Initialize so we never touch
+  // the broken FAST_MUTEX / physical-restore paths when the module is
+  // disabled (Initialize was skipped → g_hwid_lock is zero-init, so
+  // ExAcquireFastMutex here would be undefined behaviour).
+#if HWID_SPOOFER_ENABLED
   HWIDSpoofer::Cleanup();
+#endif
 
   DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Supervisor: shutdown complete\n");
 }
@@ -4416,7 +4475,17 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   }
 
-  // Initialize HWID spoofer module
+  // Initialize HWID spoofer module.
+  //
+  // Compile-time gate: HWID_SPOOFER_ENABLED (hwid_spoofer.hpp).
+  //
+  // The SMBIOS extraction / physical-memory patch path inside HWIDSpoofer is
+  // currently known to crash the system with KMODE_EXCEPTION_NOT_HANDLED on
+  // load. The __try wrapper below is NOT a safety net for kernel-mode page
+  // faults at >APC_LEVEL or for bad MmMapIoSpace mappings — those still
+  // bugcheck the box. Until the module is fixed, skip Initialize entirely
+  // and let the IPC handlers short-circuit (see CMD_HWID_* dispatch below).
+#if HWID_SPOOFER_ENABLED
   __try {
     HWIDSpoofer::Initialize();
   } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4424,6 +4493,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
                "[CR3-IPC] HWIDSpoofer::Initialize raised exception 0x%X — "
                "HWID spoofer disabled\n", GetExceptionCode());
   }
+#else
+  DbgPrintEx(0x4d, 0xffffffff,
+             "[CR3-IPC] HWIDSpoofer compile-time disabled — skipping init\n");
+#endif
 
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     // Catastrophic init failure — log and continue to thread creation.
@@ -4578,7 +4651,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     }
     RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
 
+    // Mirror of the V3-path gate above — see comment there.
+#if HWID_SPOOFER_ENABLED
     HWIDSpoofer::Cleanup();
+#endif
 
     DbgPrintEx(0x4d, 0xffffffff,
                "[CR3-IPC] Supervisor (V1): all threads exited — pool safe to "

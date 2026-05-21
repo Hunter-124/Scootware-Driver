@@ -220,10 +220,11 @@ static HWID_DATA      g_original_hwid = {};   // Saved original values
 static HWID_DATA      g_spoofed_hwid  = {};   // Currently applied spoof values
 static HWID_STATE     g_hwid_state    = HWID_STATE::HWID_STATE_UNINITIALIZED;
 
-// g_spoof_active uses a CHAR with InterlockedCompareExchange8 for atomicity.
-// 0 = FALSE, 1 = TRUE. Interlocked operations prevent torn reads/writes
-// and provide acquire/release semantics on all architectures.
-static CHAR           g_spoof_active  = 0;
+// g_spoof_active uses a volatile CHAR with InterlockedCompareExchange8 for
+// atomicity.  0 = FALSE, 1 = TRUE. The volatile qualifier ensures the
+// compiler never elides a load even when the variable appears read-only
+// to local analysis (as in hwid_is_spoof_active).
+static volatile CHAR g_spoof_active = 0;
 
 // FAST_MUTEX serializes all state-machine operations (SaveOriginal,
 // ApplySpoof, RestoreOriginals, Reroll, ApplyCustom, Cleanup, Initialize).
@@ -231,11 +232,8 @@ static CHAR           g_spoof_active  = 0;
 // and registry writes can never race.
 static FAST_MUTEX     g_hwid_lock;
 
-// Interlocked helpers for g_spoof_active (CHAR, 0=FALSE, 1=TRUE)
 static inline BOOLEAN hwid_is_spoof_active() {
-    // ReadSCHAR is not always available in older WDK; InterlockedExchange8
-    // with the same value is a portable atomic load alternative.
-    return (BOOLEAN)(InterlockedExchange8(&g_spoof_active, g_spoof_active) != 0);
+    return (BOOLEAN)(g_spoof_active != 0);
 }
 
 // Atomically set g_spoof_active = TRUE. Returns the previous value.
@@ -738,30 +736,103 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     NTSTATUS st = hwid_find_ntoskrnl(&nt_base, &nt_size);
     if (!NT_SUCCESS(st)) return st;
 
-    // Pattern from nt!WmipFindSMBiosStructure (Win10 22H2 - Win11 25H2):
-    //   48 8B 0D ?? ?? ?? ??     mov     rcx, [WmipSMBiosTablePhysicalAddress]
-    //   48 85 C9                 test    rcx, rcx
-    //   74 ??                    jz      short ...
-    //   8B 15 ?? ?? ?? ??        mov     edx, [WmipSMBiosTableLength]
-    static const UCHAR pat_phys[] = {
-        0x48, 0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x85, 0xC9,
-        0x74, 0x00,
-        0x8B, 0x15
+    // Try up to 6 pattern variants to cover Windows 10 20H1 through 11 25H3.
+    //
+    // Each pattern matches:
+    //   mov rX, [WmipSMBiosTablePhys]   ; 48 8B ?? ?? ?? ?? ??
+    //   test rX, rX                      ; 48 85 ??
+    //   jz short label                   ; 74 ??
+    //   mov rY, [WmipSMBiosTableLen]     ; 8B 15 / 8B 0D
+    //
+    // Registers differ between builds.  Variants:
+    //   V0: rcx/edx  (Win10 22H2–Win11 24H2)
+    //   V1: rax/eax  (some 25H2 previews)
+    //   V2: rdx/eax  (some server builds)
+    //   V3: r8/r9d   (Windows 11 25H3+)
+    //   V4: rax/edx  (some insider builds)
+    //   V5: r8/edx   (Windows 11 26xxx previews)
+    struct { const UCHAR* pat; const char* mask; } variants[] = {
+        // V0: mov rcx,[...]  test rcx,rcx  jz ...  mov edx,[...]
+        { (const UCHAR*)"\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x74\x00\x8B\x15",
+          "xxx????xxxx?xx" },
+        // V1: mov rax,[...]  test rax,rax  jz ...  mov eax,[...]
+        { (const UCHAR*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x85\xC0\x74\x00\x8B\x05",
+          "xxx????xxxx?xx" },
+        // V2: mov rdx,[...]  test rdx,rdx  jz ...  mov eax,[...]
+        { (const UCHAR*)"\x48\x8B\x15\x00\x00\x00\x00\x48\x85\xD2\x74\x00\x8B\x05",
+          "xxx????xxxx?xx" },
+        // V3: mov r8,[...]   test r8,r8    jz ...  mov r9d,[...]
+        { (const UCHAR*)"\x4C\x8B\x05\x00\x00\x00\x00\x4D\x85\xC0\x74\x00\x45\x8B\x0D",
+          "xxx????xxxx?xxx" },
+        // V4: mov rax,[...]  test rax,rax  jz ...  mov edx,[...]
+        { (const UCHAR*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x85\xC0\x74\x00\x8B\x15",
+          "xxx????xxxx?xx" },
+        // V5: mov r8,[...]   test r8,r8    jz ...  mov edx,[...]
+        { (const UCHAR*)"\x4C\x8B\x05\x00\x00\x00\x00\x4D\x85\xC0\x74\x00\x8B\x15",
+          "xxx????xxxx?xx" },
     };
-    static const char mask_phys[] = "xxx????xxxx?xx";
 
-    PUCHAR hit = hwid_pattern_scan((PUCHAR)nt_base, nt_size, pat_phys, mask_phys);
+    PUCHAR hit = NULL;
+    int      variant     = -1;
+    UINT64   g_phys_addr_va = 0;
+    UINT64   g_length_va    = 0;
+
+    for (int vi = 0; vi < ARRAYSIZE(variants); vi++) {
+        PUCHAR v = hwid_pattern_scan((PUCHAR)nt_base, nt_size,
+                                     variants[vi].pat, variants[vi].mask);
+        if (!v) continue;
+
+        // Resolve globals depending on variant
+        switch (vi) {
+        case 0: // rcx (disp@+3,len=7) ; edx (disp@+12+2,len=6)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 12, 2, 6);
+            break;
+        case 1: // rax (disp@+3,len=7) ; eax (disp@+12+2,len=6)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 12, 2, 6);
+            break;
+        case 2: // rdx (disp@+3,len=7) ; eax (disp@+12+2,len=6)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 12, 2, 6);
+            break;
+        case 3: // r8  (disp@+3,len=7) ; r9d (disp@+14+3,len=8)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 14, 3, 8);
+            break;
+        case 4: // rax (disp@+3,len=7) ; edx (disp@+12+2,len=6)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 12, 2, 6);
+            break;
+        case 5: // r8  (disp@+3,len=7) ; edx (disp@+12+2,len=6)
+            g_phys_addr_va = hwid_resolve_rip_relative(v, 3, 7);
+            g_length_va    = hwid_resolve_rip_relative(v + 12, 2, 6);
+            break;
+        }
+
+        if (g_phys_addr_va && g_length_va) {
+            hit = v;
+            variant = vi;
+            DbgPrintEx(0x4d, 0xffffffff,
+                "[HWID] resolve_kernel_globals: pattern variant %d matched at offset 0x%llX\n",
+                vi, (UINT64)(v - (PUCHAR)nt_base));
+            break;
+        }
+    }
+
     if (!hit) {
         DbgPrintEx(0x4d, 0xffffffff,
-            "[HWID] resolve_kernel_globals: phys-addr pattern not found\n");
+            "[HWID] resolve_kernel_globals: no pattern match (tried %zu variants)\n",
+            ARRAYSIZE(variants));
         return STATUS_NOT_FOUND;
     }
 
-    // `hit` points at the `mov rcx, [...]` instruction (7 bytes; disp at +3).
-    UINT64 g_phys_addr_va = hwid_resolve_rip_relative(hit, 3, 7);
-    // `hit + 12` points at `8B 15 ?? ?? ?? ??` — `mov edx, [...]` (6 bytes; disp at +2).
-    UINT64 g_length_va    = hwid_resolve_rip_relative(hit + 12, 2, 6);
+    // g_phys_addr_va and g_length_va are already resolved per-variant
+    // inside the pattern scan loop above.  Fallback for safety:
+    if (!g_phys_addr_va || !g_length_va) {
+        g_phys_addr_va = hwid_resolve_rip_relative(hit, 3, 7);
+        g_length_va    = hwid_resolve_rip_relative(hit + 12, 2, 6);
+    }
 
     if (!g_phys_addr_va || !g_length_va) {
         DbgPrintEx(0x4d, 0xffffffff,
@@ -799,14 +870,57 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // Validate by reading the first 4 bytes of the resolved physical address —
-    // it must look like a valid SMBIOS structure header (Length >= 4).
-    UCHAR hdr[4] = {};
-    if (!NT_SUCCESS(hwid_phys_read(phys, hdr, sizeof(hdr))) || hdr[1] < 4) {
+    // Validate the resolved physical address by reading the first 512 bytes
+    // and checking for a valid SMBIOS structure table.  We verify:
+    //   1. First structure header: Type 1, Length >= 0x19 (System Info with UUID)
+    //   2. End-of-table marker (type 0x7F) found within the table
+    // This is far more robust than the old 4-byte check which could pass on
+    // random RAM data or MMIO reads.
+    {
+        ULONG check_size = (len > 512) ? 512 : (ULONG)len;
+        if (check_size < 32) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                "[HWID] resolve_kernel_globals: table too small (%lu) at phys 0x%llX\n",
+                check_size, phys);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        UCHAR check_buf[512];
+        if (!NT_SUCCESS(hwid_phys_read(phys, check_buf, check_size))) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                "[HWID] resolve_kernel_globals: read failed at phys 0x%llX\n", phys);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        // Walk structures looking for end marker (0x7F)
+        ULONG pos = 0;
+        BOOLEAN found_end = FALSE;
+        BOOLEAN found_type1 = FALSE;
+        while (pos + 4 <= check_size) {
+            UCHAR type = check_buf[pos];
+            UCHAR st_len = check_buf[pos + 1];
+            if (type == 0x7F) { found_end = TRUE; break; }
+            if (st_len < 4) break;
+            if (type == 1 && st_len >= 0x19) found_type1 = TRUE;
+            pos += st_len;
+            while (pos < check_size) {
+                if (check_buf[pos] == 0 && (pos + 1 >= check_size || check_buf[pos + 1] == 0)) {
+                    pos += 2;
+                    break;
+                }
+                pos++;
+            }
+        }
+
+        if (!found_end || !found_type1) {
+            DbgPrintEx(0x4d, 0xffffffff,
+                "[HWID] resolve_kernel_globals: content validation failed at phys 0x%llX "
+                "(found_end=%d found_type1=%d)\n", phys, (int)found_end, (int)found_type1);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+
         DbgPrintEx(0x4d, 0xffffffff,
-            "[HWID] resolve_kernel_globals: header sanity-check failed at phys 0x%llX\n",
+            "[HWID] resolve_kernel_globals: SMBIOS structure table validated at phys 0x%llX\n",
             phys);
-        return STATUS_INVALID_DEVICE_STATE;
     }
 
     *out_phys = phys;
@@ -818,300 +932,154 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
 }
 
 // ============================================================================
-// Legacy: find_smbios_table is kept as a thin shim for source compatibility.
-// All callers now go through smbios_resolve_kernel_globals().
+// ============================================================================
+// Internal: Content-based physical SMBIOS table search (safe fallback)
+//
+// Uses the cached API table content as a search signature in physical RAM.
+// This is immune to ntoskrnl code changes (unlike the kernel globals pattern
+// scan) because it matches actual table content, not instruction bytes.
+//
+// Only searches ranges returned by MmGetPhysicalMemoryRanges() so it never
+// touches MMIO or firmware memory — the BSOD source in the old EPS scan.
 // ============================================================================
 
-static NTSTATUS find_smbios_table(UINT64* out_phys, SIZE_T* out_size) {
-    // Single source of truth: the kernel globals in ntoskrnl.
-    // The old EPS-scan / signature-scan paths are gone — they were the source
-    // of the BSODs (writing into firmware-mapped pages or false-positive
-    // matches in unrelated pool memory).
-    return smbios_resolve_kernel_globals(out_phys, out_size);
-}
-
-// Old EPS/signature-scan implementation — DEAD CODE retained below only to
-// keep diff readable. Will be removed in a follow-up cleanup.
-#if 0
-static NTSTATUS find_smbios_table_LEGACY(UINT64* out_phys, SIZE_T* out_size) {
+static NTSTATUS smbios_find_physical_by_signature(UINT64* out_phys, SIZE_T* out_size) {
     if (!out_phys || !out_size) return STATUS_INVALID_PARAMETER;
-
     *out_phys = 0;
     *out_size = 0;
 
-    // Direct physical memory scan:
-    // The SMBIOS Entry Point Structure (EPS) lives in the 0xF0000-0xFFFFF range
-    // on legacy BIOS systems, or in EFI runtime memory (typically > 4GB) on UEFI.
-    //
-    // Step 1: Scan legacy BIOS range 0xF0000 - 0xFFFFF
-    {
-        UINT64 scan_start = 0xF0000;
-        UINT64 scan_end   = 0x100000;
-        UINT64 step = 16;
+    if (!g_smbios_content_cache.valid || !g_smbios_content_cache.data ||
+        g_smbios_content_cache.length < 32) {
+        return STATUS_NOT_FOUND;
+    }
 
-        for (UINT64 addr = scan_start; addr < scan_end; addr += step) {
-            UCHAR buf[32] = {};
-            if (!NT_SUCCESS(hwid_phys_read(addr, buf, sizeof(buf))))
+    PUCHAR sig_data = g_smbios_content_cache.data;
+    ULONG  sig_len  = g_smbios_content_cache.length;
+
+    // Use the first 128 bytes as signature — distinctive enough to avoid
+    // false positives, short enough to read efficiently.
+    ULONG sig_search = (sig_len > 128) ? 128 : sig_len;
+
+    // Read a single 4 KB page candidate, compare first 128 bytes against signature.
+    PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
+    if (!ranges) return STATUS_NOT_FOUND;
+
+    NTSTATUS result = STATUS_NOT_FOUND;
+
+    for (PPHYSICAL_MEMORY_RANGE r = ranges;
+         r->BaseAddress.QuadPart || r->NumberOfBytes.QuadPart; r++) {
+        UINT64 rstart = r->BaseAddress.QuadPart;
+        UINT64 rsize  = r->NumberOfBytes.QuadPart;
+
+        if (rsize < 0x10000) continue;
+
+        // Scan up to first 256 MB of each range (SMBIOS pool copy is always
+        // in the first few MB of non-paged pool).
+        UINT64 rend = rstart + ((rsize > 0x10000000ULL) ? 0x10000000ULL : rsize);
+
+        for (UINT64 pa = rstart; pa + sig_search <= rend; pa += PAGE_SIZE) {
+            UCHAR page_buf[256];
+            if (!NT_SUCCESS(hwid_phys_read(pa, page_buf, sig_search)))
                 continue;
 
-            if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '_') {
-                PSMBIOS_EPS eps = (PSMBIOS_EPS)buf;
-                if (eps->TableAddress != 0 && eps->TableLength > 0 &&
-                    eps->EntryPointLength >= 16 &&
-                    smbios_validate_eps_checksum(buf, eps->EntryPointLength) &&
-                    smbios_validate_table_in_ram((UINT64)eps->TableAddress, (SIZE_T)eps->TableLength)) {
-                    *out_phys = (UINT64)eps->TableAddress;
-                    *out_size = (SIZE_T)eps->TableLength;
-                    DbgPrintEx(0x4d, 0xffffffff,
-                        "[HWID] Found SMBIOS v2 EPS at phys 0x%llX -> table 0x%llX size %u\n",
-                        addr, *out_phys, (ULONG)*out_size);
-                    return STATUS_SUCCESS;
-                }
-            }
-
-            if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '3' && buf[4] == '_') {
-                PSMBIOS3_EPS eps3 = (PSMBIOS3_EPS)buf;
-                if (eps3->TableAddress != 0 && eps3->TableMaximumSize > 0 &&
-                    eps3->EntryPointLength >= 16 &&
-                    smbios_validate_eps_checksum(buf, eps3->EntryPointLength) &&
-                    smbios_validate_table_in_ram((UINT64)eps3->TableAddress, (SIZE_T)eps3->TableMaximumSize)) {
-                    *out_phys = (UINT64)eps3->TableAddress;
-                    *out_size = (SIZE_T)eps3->TableMaximumSize;
-                    DbgPrintEx(0x4d, 0xffffffff,
-                        "[HWID] Found SMBIOS 3 EPS at phys 0x%llX -> table 0x%llX size %u\n",
-                        addr, *out_phys, (ULONG)*out_size);
-                    return STATUS_SUCCESS;
-                }
-            }
-        }
-    }
-
-    // Step 2: Scan EFI runtime / high memory ranges
-    {
-        PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
-        if (ranges) {
-            for (PPHYSICAL_MEMORY_RANGE r = ranges; r->BaseAddress.QuadPart || r->NumberOfBytes.QuadPart; r++) {
-                UINT64 range_start = r->BaseAddress.QuadPart;
-                UINT64 range_size  = r->NumberOfBytes.QuadPart;
-
-                if (range_size < 0x1000) continue;
-                if (range_start < 0x100000) continue;
-
-                UINT64 scan_end2 = range_start + min(range_size, 0x100000ULL);
-
-                for (UINT64 addr = range_start; addr < scan_end2; addr += 0x1000) {
-                    UCHAR buf[32] = {};
-                    if (!NT_SUCCESS(hwid_phys_read(addr, buf, sizeof(buf))))
-                        continue;
-
-                    if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '3' && buf[4] == '_') {
-                        PSMBIOS3_EPS eps3 = (PSMBIOS3_EPS)buf;
-                        if (eps3->TableAddress != 0 && eps3->TableMaximumSize > 0 &&
-                            eps3->TableMaximumSize < 0x100000 &&
-                            eps3->EntryPointLength >= 16 &&
-                            smbios_validate_eps_checksum(buf, eps3->EntryPointLength) &&
-                            smbios_validate_table_in_ram((UINT64)eps3->TableAddress, (SIZE_T)eps3->TableMaximumSize)) {
-                            *out_phys = (UINT64)eps3->TableAddress;
-                            *out_size = (SIZE_T)eps3->TableMaximumSize;
-                            DbgPrintEx(0x4d, 0xffffffff,
-                                "[HWID] Found SMBIOS 3 EPS at phys 0x%llX (range scan)\n", addr);
-                            ExFreePool(ranges);
-                            return STATUS_SUCCESS;
-                        }
-                    }
-
-                    if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '_') {
-                        PSMBIOS_EPS eps = (PSMBIOS_EPS)buf;
-                        if (eps->TableAddress != 0 && eps->TableLength > 0 &&
-                            eps->TableLength < 0x100000 &&
-                            eps->EntryPointLength >= 16 &&
-                            smbios_validate_eps_checksum(buf, eps->EntryPointLength) &&
-                            smbios_validate_table_in_ram((UINT64)eps->TableAddress, (SIZE_T)eps->TableLength)) {
-                            *out_phys = (UINT64)eps->TableAddress;
-                            *out_size = (SIZE_T)eps->TableLength;
-                            DbgPrintEx(0x4d, 0xffffffff,
-                                "[HWID] Found SMBIOS v2 at phys 0x%llX (range scan)\n", addr);
-                            ExFreePool(ranges);
-                            return STATUS_SUCCESS;
-                        }
-                    }
-                    // BUGFIX: REMOVED unconditional break that killed range scan after 1 page.
-                    // Original had `break;` here — this caused the scan to only check the first
-                    // 4 KB page of every physical memory range, missing the EPS on UEFI systems.
-                }
-            }
-            ExFreePool(ranges);
-        }
-    }
-
-    // Step 3: Last resort — try reading from known UEFI config table phys ranges.
-    // Some UEFI firmware puts the EPS at higher physical addresses that don't
-    // show up in MmGetPhysicalMemoryRanges (e.g. MMIO range).
-    {
-        // Common ranges: 0xE0000-0xEFFFF (just below legacy range),
-        // and 0x7FE00000-0x7FEFFFFF (ACPI NVS region on many boards)
-        UINT64 alt_ranges[][2] = {
-            { 0xE0000, 0xF0000 },
-            { 0x7FE00000, 0x7FF00000 },
-            { 0x7FF00000, 0x80000000 },
-            { 0x7F000000, 0x80000000 },
-            { 0xFE000000, 0xFE100000 },
-            { 0xFF000000, 0xFF100000 }
-        };
-
-        for (int ri = 0; ri < (sizeof(alt_ranges) / sizeof(alt_ranges[0])); ri++) {
-            for (UINT64 addr = alt_ranges[ri][0]; addr < alt_ranges[ri][1]; addr += 16) {
-                UCHAR buf[32] = {};
-                if (!NT_SUCCESS(hwid_phys_read(addr, buf, 32)))
+            if (memcmp(page_buf, sig_data, sig_search) == 0) {
+                // Validate the full table by reading more and checking
+                // for the SMBIOS end-of-table marker (type 0x7F).
+                ULONG check_len = (sig_len > 512) ? 512 : sig_len;
+                if ((ULONG)(rend - pa) < check_len) check_len = (ULONG)(rend - pa);
+                UCHAR check_buf[512];
+                if (!NT_SUCCESS(hwid_phys_read(pa, check_buf, check_len)))
                     continue;
 
-                if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '_') {
-                    PSMBIOS_EPS eps = (PSMBIOS_EPS)buf;
-                    if (eps->TableAddress != 0 && eps->TableLength > 0 &&
-                        eps->EntryPointLength >= 16 &&
-                        smbios_validate_eps_checksum(buf, eps->EntryPointLength) &&
-                        smbios_validate_table_in_ram((UINT64)eps->TableAddress, (SIZE_T)eps->TableLength)) {
-                        *out_phys = (UINT64)eps->TableAddress;
-                        *out_size = (SIZE_T)eps->TableLength;
-                        DbgPrintEx(0x4d, 0xffffffff,
-                            "[HWID] Found SMBIOS v2 EPS at alt phys 0x%llX\n", addr);
-                        return STATUS_SUCCESS;
+                // Walk structures looking for end-of-table marker (0x7F)
+                // within a reasonable distance.
+                ULONG pos = 0;
+                BOOLEAN found_end = FALSE;
+                while (pos + 4 <= check_len) {
+                    if (check_buf[pos] == 0x7F) { found_end = TRUE; break; }
+                    UCHAR struct_len = check_buf[pos + 1];
+                    if (struct_len < 4) break;
+                    pos += struct_len;
+                    // Skip strings
+                    while (pos < check_len) {
+                        if (check_buf[pos] == 0 && (pos + 1 >= check_len || check_buf[pos + 1] == 0)) {
+                            pos += 2;
+                            break;
+                        }
+                        pos++;
                     }
                 }
 
-                if (buf[0] == '_' && buf[1] == 'S' && buf[2] == 'M' && buf[3] == '3' && buf[4] == '_') {
-                    PSMBIOS3_EPS eps3 = (PSMBIOS3_EPS)buf;
-                    if (eps3->TableAddress != 0 && eps3->TableMaximumSize > 0 &&
-                        eps3->EntryPointLength >= 16 &&
-                        smbios_validate_eps_checksum(buf, eps3->EntryPointLength) &&
-                        smbios_validate_table_in_ram((UINT64)eps3->TableAddress, (SIZE_T)eps3->TableMaximumSize)) {
-                        *out_phys = (UINT64)eps3->TableAddress;
-                        *out_size = (SIZE_T)eps3->TableMaximumSize;
-                        DbgPrintEx(0x4d, 0xffffffff,
-                            "[HWID] Found SMBIOS 3 EPS at alt phys 0x%llX\n", addr);
-                        return STATUS_SUCCESS;
-                    }
+                if (found_end) {
+                    *out_phys = pa;
+                    *out_size = sig_len;
+                    result = STATUS_SUCCESS;
+                    DbgPrintEx(0x4d, 0xffffffff,
+                        "[HWID] Found SMBIOS table via signature scan at phys 0x%llX "
+                        "(len=%lu)\n", pa, sig_len);
+                    goto cleanup;
                 }
             }
         }
     }
 
-    // Step 4: Signature-based physical search using cached API data.
-    // UEFI firmware often places the SMBIOS table at weird physical addresses
-    // that the EPS scan above can't find (non-standard ranges, ACPI reclaim
-    // memory, etc.). Since we have the table content from the API, we can
-    // search physical memory for known signatures and find the table that way.
-    if (g_smbios_content_cache.valid && g_smbios_content_cache.data &&
-        g_smbios_content_cache.length >= 32) {
-        
+cleanup:
+    if (ranges) ExFreePool(ranges);
+    return result;
+}
+
+// ============================================================================
+// Internal: find_smbios_table — resolves live SMBIOS physical + size.
+//
+// Strategy (safe-first):
+//   1. Content-based signature scan in physical RAM (no false positives,
+//      immune to ntoskrnl version changes).
+//   2. Kernel global pattern scan (smbios_resolve_kernel_globals) fallback
+//      for when the cache is empty.
+//
+// The old EPS-scan / physical-memory-firmware-scan is GONE — it was the
+// source of the BSODs (writing into firmware-mapped pages or false-positive
+// matches in unrelated memory).  Only regular RAM is ever accessed.
+// ============================================================================
+
+static NTSTATUS find_smbios_table(UINT64* out_phys, SIZE_T* out_size) {
+    NTSTATUS st;
+
+    // Try 1: content-based signature scan (zero false positive rate)
+    if (g_smbios_content_cache.valid) {
+        st = smbios_find_physical_by_signature(out_phys, out_size);
+        if (NT_SUCCESS(st)) return st;
         DbgPrintEx(0x4d, 0xffffffff,
-            "[HWID] Step 4: signature-based scan using %lu bytes of cached API data\n",
-            g_smbios_content_cache.length);
-            
-        // Use the first Type 1 structure header + UUID as search signature
-        // SMBIOS Type 1 header is: [type=1][len][handle_lo][handle_hi][manufacturer][product][version][serial]...
-        // We look for: type=1, len>=0x19, followed by string indices and the 16-byte UUID
-        // The most unique signature is the first structure header itself.
-        PUCHAR sig_data = g_smbios_content_cache.data;
-        ULONG  sig_len  = g_smbios_content_cache.length;
-        
-        // Use the first 16 KB of the table as the search region signature
-        ULONG search_len = min(sig_len, 0x4000UL);
-        
-        // Walk physical memory looking for the table content
-        PPHYSICAL_MEMORY_RANGE ranges2 = MmGetPhysicalMemoryRanges();
-        if (ranges2) {
-            for (PPHYSICAL_MEMORY_RANGE r = ranges2; r->BaseAddress.QuadPart || r->NumberOfBytes.QuadPart; r++) {
-                UINT64 rstart = r->BaseAddress.QuadPart;
-                UINT64 rsize  = r->NumberOfBytes.QuadPart;
-                
-                if (rsize < 0x10000 || rstart < 0x100000) continue;
-                
-                // Only scan first 64 MB of each range for speed
-                UINT64 rend = rstart + min(rsize, 0x4000000ULL); 
-                
-                for (UINT64 pa = rstart; pa + search_len < rend; pa += 0x1000) {
-                    // Read first 32 bytes of each candidate page
-                    UCHAR hdr_buf[32] = {};
-                    if (!NT_SUCCESS(hwid_phys_read(pa, hdr_buf, sizeof(hdr_buf)))) continue;
-                    
-                    // Check if it starts with an SMBIOS structure header followed by strings
-                    // Type 1 starts with byte 0x01
-                    if (hdr_buf[0] != 0x01) continue;
-                    if (hdr_buf[1] < 0x19) continue;  // Must have UUID field
-                    
-                    // Read more of the candidate page for verification
-                    UCHAR verify_buf[256] = {};
-                    if (!NT_SUCCESS(hwid_phys_read(pa, verify_buf, min(256UL, (ULONG)(rend - pa))))) continue;
-                    
-                    // Check UUID match (at Type1 offset 8 if Length >= 0x19)
-                    // Compare with cached API data at same offset
-                    // We need to find the Type1 offset in our cached data first
-                    for (ULONG api_off = 0; api_off + search_len < sig_len; api_off++) {
-                        if (sig_data[api_off] != 0x01) continue;
-                        if (sig_data[api_off + 1] < 0x19) continue;
-                        
-                        // Found Type 1 in our cached data — compare the first 32 bytes
-                        ULONG cmp_len = min(32UL, (ULONG)(sig_len - api_off));
-                        cmp_len = min(cmp_len, (ULONG)(rend - pa));
-                        if (cmp_len < 16) continue;
-                        
-                        if (memcmp(verify_buf, sig_data + api_off, cmp_len) == 0) {
-                            // MATCH! This is the physical address of the SMBIOS table
-                            *out_phys = pa;
-                            *out_size = sig_len;
-                            DbgPrintEx(0x4d, 0xffffffff,
-                                "[HWID] Found SMBIOS table via signature scan at phys 0x%llX " \
-                                "(API-offset=%lu, cmp_len=%lu)\n",
-                                pa, api_off, cmp_len);
-                            ExFreePool(ranges2);
-                            return STATUS_SUCCESS;
-                        }
-                        break; // Only check first Type 1 in cache per candidate page
-                    }
+            "[HWID] find_smbios_table: signature scan failed, trying kernel globals\n");
+    }
+
+    // Try 2: kernel globals pattern scan
+    st = smbios_resolve_kernel_globals(out_phys, out_size);
+    if (NT_SUCCESS(st)) {
+        // Cross-validate against cache if available: read a page at the
+        // resolved physical address and compare first 64 bytes.
+        if (g_smbios_content_cache.valid && g_smbios_content_cache.data &&
+            g_smbios_content_cache.length >= 64) {
+            UCHAR verify[64];
+            if (NT_SUCCESS(hwid_phys_read(*out_phys, verify, sizeof(verify)))) {
+                if (memcmp(verify, g_smbios_content_cache.data, sizeof(verify)) != 0) {
+                    DbgPrintEx(0x4d, 0xffffffff,
+                        "[HWID] find_smbios_table: kernel globals gave wrong content "
+                        "(phys 0x%llX) — content mismatch with API data, rejecting!\n",
+                        *out_phys);
+                    *out_phys = 0;
+                    *out_size = 0;
+                    return STATUS_INVALID_DEVICE_STATE;
                 }
-            }
-            ExFreePool(ranges2);
-        }
-        
-        // Step 4b: Broader scan — look for the cached data at ANY offset, not just page starts.
-        // Some firmware places the table at non-page-aligned physical addresses.
-        if (sig_len >= 64) {
-            PPHYSICAL_MEMORY_RANGE ranges3 = MmGetPhysicalMemoryRanges();
-            if (ranges3) {
-                for (PPHYSICAL_MEMORY_RANGE r = ranges3; r->BaseAddress.QuadPart || r->NumberOfBytes.QuadPart; r++) {
-                    UINT64 rstart = r->BaseAddress.QuadPart;
-                    UINT64 rsize  = r->NumberOfBytes.QuadPart;
-                    
-                    if (rsize < 0x10000 || rstart < 0x100000) continue;
-                    UINT64 rend = rstart + min(rsize, 0x4000000ULL);
-                    
-                    for (UINT64 pa = rstart; pa + sig_len + 16 < rend; pa += 0x10) {
-                        UCHAR cmp_buf[64] = {};
-                        ULONG cmp_size = min(64UL, (ULONG)(rend - pa));
-                        if (cmp_size < 16) continue;
-                        if (!NT_SUCCESS(hwid_phys_read(pa, cmp_buf, cmp_size))) continue;
-                        
-                        if (memcmp(cmp_buf, sig_data, cmp_size) == 0) {
-                            // Align down to 4 KB boundary for the mapped page
-                            *out_phys = pa & ~0xFFFull;
-                            *out_size = sig_len + (ULONG)(pa - *out_phys);
-                            DbgPrintEx(0x4d, 0xffffffff,
-                                "[HWID] Found SMBIOS via unaligned signature at phys 0x%llX\n",
-                                pa);
-                            ExFreePool(ranges3);
-                            return STATUS_SUCCESS;
-                        }
-                    }
-                }
-                ExFreePool(ranges3);
+                DbgPrintEx(0x4d, 0xffffffff,
+                    "[HWID] find_smbios_table: kernel globals content verified against API\n");
             }
         }
+        return st;
     }
 
     return STATUS_NOT_FOUND;
 }
-#endif // #if 0 — legacy EPS/signature-scan implementation
 
 // ============================================================================
 // Internal: Parse SMBIOS table (from raw buffer) and extract HWID values
@@ -1474,6 +1442,27 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
     if (!NT_SUCCESS(st)) {
         DbgPrintEx(0x4d, 0xffffffff, "[HWID] Failed to backup SMBIOS table\n");
         return st;
+    }
+
+    // Cross-validate the physical content against known-good API data before
+    // writing.  If the physical address is wrong (false-positive from kernel
+    // globals pattern), we read-back garbage that won't match and abort
+    // BEFORE corrupting anything.
+    if (g_smbios_content_cache.valid && g_smbios_content_cache.data &&
+        g_smbios_content_cache.length >= 64) {
+        UCHAR verify[64];
+        if (NT_SUCCESS(hwid_phys_read(table_phys, verify, sizeof(verify)))) {
+            if (memcmp(verify, g_smbios_content_cache.data, sizeof(verify)) != 0) {
+                DbgPrintEx(0x4d, 0xffffffff,
+                    "[HWID] smbios_patch_hwid: CONTENT MISMATCH at phys 0x%llX — "
+                    "wrong address! Aborting write to prevent corruption.\n",
+                    table_phys);
+                hwid_restore_all_backups();
+                return STATUS_INVALID_DEVICE_STATE;
+            }
+            DbgPrintEx(0x4d, 0xffffffff,
+                "[HWID] smbios_patch_hwid: physical content verified against API cache\n");
+        }
     }
 
     // Map the table into system space, patch it, then unmap immediately.

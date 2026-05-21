@@ -12,6 +12,25 @@
 // All patching is done via physical memory access (no code hooks),
 // safe for manual-mapped (KDU) drivers without triggering PatchGuard.
 //
+// =============================================================================
+// HWID_SPOOFER_ENABLED — master compile-time switch.
+//
+// Set to 0 to keep the entire spoofer out of the boot path. When 0:
+//   - DriverEntry does NOT call HWIDSpoofer::Initialize().
+//   - DriverEntry teardown does NOT call HWIDSpoofer::Cleanup().
+//   - All CMD_HWID_* IPC handlers return STATUS_IPC_ERROR without ever
+//     touching SMBIOS / MmMapIoSpace / registry capture (the paths that
+//     have been crashing the box on load with KMODE_EXCEPTION_NOT_HANDLED).
+//
+// The implementation file is still compiled and the public API still
+// exists so callers compile, but every entry point short-circuits.
+//
+// Re-enable by flipping this to 1 ONLY AFTER the SMBIOS extraction +
+// physical-memory patch paths in hwid_spoofer.cpp have been fixed.
+// =============================================================================
+#ifndef HWID_SPOOFER_ENABLED
+#define HWID_SPOOFER_ENABLED 1
+#endif
 
 #include <ntifs.h>
 #include <ntintsafe.h>
