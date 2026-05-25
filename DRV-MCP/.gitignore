@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Built helper
+helper/scootware.exe
+helper/*.obj
+helper/*.exp
+helper/*.lib

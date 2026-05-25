@@ -1,0 +1,16 @@
+[build-system]
+requires      = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "drv-mcp"
+version         = "0.1.0"
+description     = "MCP server for the Scootware CR3 kernel driver (debugging + dynamic analysis)"
+requires-python = ">=3.10"
+dependencies    = ["mcp>=1.0.0", "capstone>=5.0"]
+
+[project.scripts]
+drv-mcp = "drv_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["drv_mcp*"]
