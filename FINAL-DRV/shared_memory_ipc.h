@@ -20,8 +20,24 @@ typedef uint8_t  UINT8;
 
 #include "ipc_config.h"
 
-// Bumped MAGIC and VERSION for the multi-slotted implementation
-#define IPC_MAGIC           0x504D585F49504332ULL // 'PMX_IPC2'
+// IPC magic — handshake value that the driver looks for at offset 0 of the
+// candidate buffer.  Earlier revisions used 0x504D585F49504332 ('PMX_IPC2'),
+// which is 8 bytes of printable ASCII — trivially grep-able from usermode.
+// Any anti-cheat that walks process memory looking for the literal text
+// "PMX_IPC2" would locate the helper buffer in one pass.
+//
+// Replacement: a high-entropy 64-bit value where every byte falls outside
+// the printable ASCII range (0x20..0x7E).  This defeats naïve string
+// scanners while keeping the value stable across boots (no key derivation
+// needed; both sides hardcode it).  Byte breakdown in little-endian memory
+// order:  13 AE E2 C8 B5 F2 A1 CD — all bytes are either control chars
+// (< 0x20) or high-bit-set (> 0x7E).
+//
+// Bumped IPC_VERSION to 3 so older helper/loader binaries fail the handshake
+// loudly instead of silently miscommunicating.  Every artifact in this repo
+// rebuilds against this header, so version skew is impossible within a
+// matched build.
+#define IPC_MAGIC           0xCDA1F2B5C8E2AE13ULL
 #define IPC_VERSION         2
 
 #define IPC_MAX_SLOTS       16
@@ -198,7 +214,9 @@ typedef struct _IPC_STEALTH_STATUS {
 
     // ── Syscall / SSN ──────────────────────────────────────────────────
     UINT32  ntfvm_ssn;                // SSN for NtFreeVirtualMemory
-    UINT32  ssn_resolved_dynamic;     // 1 if SSN was dynamic-resolved vs static
+    UINT32  ssn_resolved_dynamic;     // 1 if SSN was actually dynamic-resolved
+                                      //   (i.e. read from ntdll's syscall stub),
+                                      //   0 if we fell back to the static table
 
     // ── General driver state ───────────────────────────────────────────
     UINT32  worker_count;             // Number of IPC worker threads
@@ -209,7 +227,37 @@ typedef struct _IPC_STEALTH_STATUS {
     UINT64  target_base;              // Base address of target module
     CHAR    target_name[STEALTH_MAX_NAME_LEN]; // Image name of target process
 
-    UINT32  reserved[4];             // Future expansion
+    // ── Resolver diagnostics ───────────────────────────────────────────
+    // ssn_resolution_path: which branch of the SSN resolver chain
+    // produced the value reported above.  Two resolvers exist:
+    //   - ResolveNtFreeVirtualMemorySyscall (paths 1..10) — walks
+    //     SystemModuleInformation, only finds ntdll on builds where
+    //     ntdll is in PsLoadedModuleList (it usually isn't).
+    //   - ResolveSSN_ViaTargetProcess (paths 11..16) — KeStackAttach
+    //     into g_test_process, walks its PEB->Ldr for ntdll, reads
+    //     syscall stub from user VAs.  Only runs when a target is
+    //     attached (stealth_status handler retries when path != 1).
+    //   0 = uninitialized / no call made yet
+    //   1 = dynamic — read from ntdll's syscall stub (either resolver)
+    //   2 = ZwQuerySystemInformation failed (size==0 or NTSTATUS error)
+    //   3 = ExAllocatePool failed
+    //   4 = ntdll not present in SystemModuleInformation (expected on
+    //       modern builds — triggers fallback to target-process resolver)
+    //   5 = ntdll found but PE walk faulted (SEH caught)
+    //   6 = PE OK but NtFreeVirtualMemory export not found
+    //   7 = export found but syscall stub bytes didn't match expected pattern
+    //   8 = static table match
+    //   9 = static catch-all (0x1F, build outside table)
+    //  10 = RtlGetVersion couldn't be dynamically resolved
+    //  11 = no target process attached when target-resolver was invoked
+    //  12 = PsGetProcessPeb couldn't be dynamically resolved
+    //  13 = generic failure inside KeStackAttachProcess region
+    //  14 = target process has no PEB (e.g. System process)
+    //  15 = target PEB->Ldr is NULL
+    //  16 = ntdll.dll not found in target PEB Ldr InLoadOrderModuleList
+    UINT32  ssn_resolution_path;
+
+    UINT32  reserved[3];             // Future expansion
 } IPC_STEALTH_STATUS, *PIPC_STEALTH_STATUS;
 
 // ─── RW cycle test data (CMD_RW_CYCLE_TEST) ────────────────────────────

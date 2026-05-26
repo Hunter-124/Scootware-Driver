@@ -374,6 +374,65 @@ static void cmd_shutdown(uint64_t id) {
     emit_ok(id, "");
 }
 
+static void cmd_stealth(uint64_t id) {
+    WaitResult wr = send_command(0, CMD_STEALTH_STATUS, 0, 5000);
+    if (wr != WR_SUCCESS) {
+        emit_err(id, wr == WR_TIMEOUT ? "timeout" : "driver error");
+        return;
+    }
+    IPC_STEALTH_STATUS* diag = (IPC_STEALTH_STATUS*)slot_data_buffer(0);
+
+    // Encode the 8 patch bytes as lowercase hex so the client can verify the
+    // ENDBR64 (F3 0F 1E FA) landing-pad prefix without an extra read_memory.
+    char patch_hex[17] = {0};
+    for (int i = 0; i < 8; ++i) {
+        static const char* kHex = "0123456789abcdef";
+        patch_hex[i * 2 + 0] = kHex[(diag->cave_patch_bytes[i] >> 4) & 0xF];
+        patch_hex[i * 2 + 1] = kHex[(diag->cave_patch_bytes[i]     ) & 0xF];
+    }
+
+    // Defensive copy: cave_module_name is guaranteed to be NUL-terminated by
+    // the driver, but target_name only gets terminated up to the bytes the
+    // driver wrote.  Force a NUL at the buffer's tail before formatting.
+    char target_name_buf[STEALTH_MAX_NAME_LEN + 1];
+    memcpy(target_name_buf, diag->target_name, STEALTH_MAX_NAME_LEN);
+    target_name_buf[STEALTH_MAX_NAME_LEN] = '\0';
+
+    char extra[2048];
+    snprintf(extra, sizeof(extra),
+             "thread_spoof_active=%u cave_address=%llx cave_module_base=%llx cave_size=%llu cave_module_name=%s "
+             "cave_patch_bytes=%s "
+             "stack_isolation_active=%u ret_gadget_address=%llx ret_gadget_module_base=%llx expanded_stack_size=%u "
+             "kpti_enabled=%u cr3_swap_capable=%u cr3_mode=%u ntfvm_ssn=%u ssn_resolved_dynamic=%u "
+             "ssn_resolution_path=%u "
+             "worker_count=%u discovery_active=%u target_attached=%u target_pid=%u "
+             "target_cr3=%llx target_base=%llx target_name=%s",
+             diag->thread_spoof_active,
+             (unsigned long long)diag->cave_address,
+             (unsigned long long)diag->cave_module_base,
+             diag->cave_size,
+             diag->cave_module_name[0] ? diag->cave_module_name : "none",
+             patch_hex,
+             diag->stack_isolation_active,
+             (unsigned long long)diag->ret_gadget_address,
+             (unsigned long long)diag->ret_gadget_module_base,
+             diag->expanded_stack_size,
+             diag->kpti_enabled,
+             diag->cr3_swap_capable,
+             diag->cr3_mode,
+             diag->ntfvm_ssn,
+             diag->ssn_resolved_dynamic,
+             diag->ssn_resolution_path,
+             diag->worker_count,
+             diag->discovery_active,
+             diag->target_attached,
+             diag->target_pid,
+             (unsigned long long)diag->target_cr3,
+             (unsigned long long)diag->target_base,
+             target_name_buf[0] ? target_name_buf : "none");
+    emit_ok(id, extra);
+}
+
 // ─── Main loop ─────────────────────────────────────────────────────────
 static void init_ipc_buffer() {
     memset(g_mem, 0, IPC_TOTAL_SIZE);
@@ -466,6 +525,8 @@ int wmain(int argc, wchar_t** argv) {
             cmd_result_for(id, pid, CMD_RESOLVE_DTB, "cr3");
         } else if (strcmp(cmd, "guarded") == 0) {
             cmd_result_for(id, 0, CMD_GET_GUARDED_REGION, "addr");
+        } else if (strcmp(cmd, "stealth") == 0) {
+            cmd_stealth(id);
         } else if (strcmp(cmd, "alloc") == 0 && a.count == 6) {
             uint32_t pid, type, protect;
             uint64_t size;

@@ -203,6 +203,110 @@ def driver_status() -> dict:
     }
 
 
+_CR3_MODE_NAMES = {
+    0: "cr3_swap",         # kernel CR3 in physical::m_stored_dtb — best stealth
+    1: "mdl_attach",       # KeStackAttachProcess + MDL  — KPTI fallback
+    2: "expanded_stack",   # KeExpandKernelStackAndCalloutEx — last resort
+}
+
+_STEALTH_HEX_OUT_FIELDS = (
+    "cave_address", "cave_module_base",
+    "ret_gadget_address", "ret_gadget_module_base",
+    "target_cr3", "target_base",
+)
+
+
+@mcp.tool()
+def driver_stealth_status() -> dict:
+    """
+    Query the driver's current stealth parameters, including thread spoofing
+    (code cave location, size, module), stack isolation (ret gadget address),
+    KPTI/CR3 swap state, the resolved NtFreeVirtualMemory SSN, and the
+    currently attached target process (pid + DTB + image name).
+
+    Adds two derived fields on top of the raw driver snapshot:
+      ``cr3_mode_name``  — string label for ``cr3_mode``
+                            (``cr3_swap`` / ``mdl_attach`` / ``expanded_stack``).
+      ``warnings``       — list of human-readable warnings when the snapshot
+                            indicates a feature failed to initialize
+                            (cave missing ENDBR64, SSN unresolved, etc).
+    """
+    res = _get_session().client.get_stealth_status()
+
+    # Convert raw integer addresses to hex strings for human readability.
+    for k in _STEALTH_HEX_OUT_FIELDS:
+        if k in res and isinstance(res[k], int):
+            res[k] = f"0x{res[k]:X}"
+
+    # Label cr3_mode.
+    cr3_mode = res.get("cr3_mode")
+    if isinstance(cr3_mode, int):
+        res["cr3_mode_name"] = _CR3_MODE_NAMES.get(cr3_mode, f"unknown({cr3_mode})")
+
+    # Label ssn_resolution_path (matches the enum in shared_memory_ipc.h's
+    # IPC_STEALTH_STATUS comment block).
+    ssn_path_labels = {
+        0:  "not_yet_called",
+        1:  "dynamic_ntdll_stub",
+        2:  "ZwQuerySystemInformation_failed",
+        3:  "ExAllocatePool_failed",
+        4:  "ntdll_not_in_kernel_module_list",
+        5:  "ntdll_PE_walk_faulted",
+        6:  "NtFreeVirtualMemory_export_missing",
+        7:  "syscall_stub_pattern_mismatch",
+        8:  "static_table_match",
+        9:  "static_catch_all_0x1F",
+        10: "RtlGetVersion_unresolved",
+        # Target-process resolver paths (ResolveSSN_ViaTargetProcess)
+        11: "target_process_unavailable",
+        12: "PsGetProcessPeb_unresolved",
+        13: "target_attach_generic_failure",
+        14: "target_has_no_PEB",
+        15: "target_has_no_LDR",
+        16: "ntdll_not_in_target_PEB",
+    }
+    ssn_path = res.get("ssn_resolution_path")
+    if isinstance(ssn_path, int):
+        res["ssn_resolution_path_name"] = ssn_path_labels.get(
+            ssn_path, f"unknown({ssn_path})"
+        )
+
+    # Build warnings list.  Each entry is a short sentence describing what
+    # looks wrong; an empty list means everything checked passed.
+    warnings: list[str] = []
+
+    if not res.get("thread_spoof_active"):
+        warnings.append("thread_spoof_active=0 — no code cave patched; "
+                        "worker thread Win32StartAddress is in unbacked memory.")
+    if not res.get("stack_isolation_active"):
+        warnings.append("stack_isolation_active=0 — RET gadget not resolved; "
+                        "syscall stack walks will reveal the driver.")
+    if res.get("cr3_swap_capable") == 0:
+        warnings.append("cr3_swap_capable=0 — kernel CR3 not stored; driver "
+                        "is on a KPTI fallback path (mdl_attach/expanded_stack).")
+    if res.get("ntfvm_ssn", 0) == 0 or res.get("ssn_resolved_dynamic") == 0:
+        warnings.append("ntfvm_ssn unresolved — SpoofedNtFreeVirtualMemory "
+                        "will fall back to ZwFreeVirtualMemory (detectable).")
+
+    # Verify ENDBR64 prefix on the patched cave bytes.  The driver wrote
+    # `F3 0F 1E FA <jmp>` — if those first four bytes are not present, the
+    # patch either failed or was overwritten by something later in boot.
+    patch_hex = res.get("cave_patch_bytes")
+    if isinstance(patch_hex, str) and patch_hex:
+        if not patch_hex.lower().startswith("f30f1efa"):
+            warnings.append(
+                f"cave_patch_bytes={patch_hex} — ENDBR64 prefix (F3 0F 1E FA) "
+                "missing; CET-IBT CPUs will #CP on first dispatch."
+            )
+
+    if res.get("target_attached") == 0:
+        warnings.append("target_attached=0 — driver has no usermode session; "
+                        "memory R/W commands will all fail.")
+
+    res["warnings"] = warnings
+    return res
+
+
 @mcp.tool()
 def wait_for_driver(timeout_seconds: float = 30.0) -> dict:
     """

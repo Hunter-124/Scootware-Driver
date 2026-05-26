@@ -10,6 +10,7 @@
 #pragma warning(disable: 4505)  // unreferenced helpers kept for reference
 #include "hwid_spoofer.hpp"
 #include <stddef.h> // For offsetof
+#include "kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
 #ifdef _KERNEL_MODE
 
@@ -419,7 +420,7 @@ static NTSTATUS hwid_phys_write(UINT64 phys_addr, PVOID buffer, SIZE_T size) {
 
     // Never write to MMIO/device memory — only actual RAM is safe for writes.
     if (!hwid_is_ram_address(phys_addr, size)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] Rejecting write to non-RAM physical address 0x%llX (size %zu)\n",
             phys_addr, size);
         return STATUS_ACCESS_DENIED;
@@ -567,7 +568,7 @@ static NTSTATUS smbios_query_raw_table(PUCHAR* out_buffer, PULONG out_length) {
     ZwQuerySystemInformation((ULONG)SystemFirmwareTableInformation,
                              NULL, 0, &buf_size);
     if (!buf_size) {
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] smbios_query_raw_table: system returned 0 size\n");
+        KIPC_LOG( "[HWID] smbios_query_raw_table: system returned 0 size\n");
         return STATUS_NOT_FOUND;
     }
 
@@ -599,7 +600,7 @@ static NTSTATUS smbios_query_raw_table(PUCHAR* out_buffer, PULONG out_length) {
     // The call may succeed with table data following the fixed header.
     // Minimum valid: header + at least 1 structure byte
     if (!NT_SUCCESS(st) || buf_size <= sizeof(HWID_FIRMWARE_TABLE_INFORMATION)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[HWID] smbios_query_raw_table: ZwQuerySystemInformation failed 0x%X, "
                    "buf_size=%lu\n", st, buf_size);
         st = NT_SUCCESS(st) ? STATUS_NOT_FOUND : st;
@@ -687,7 +688,7 @@ static NTSTATUS hwid_find_ntoskrnl(PVOID* out_base, ULONG* out_size) {
     *out_base = mods->Modules[0].ImageBase;
     *out_size = mods->Modules[0].ImageSize;
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
         "[HWID] ntoskrnl base=%p size=0x%X\n", *out_base, *out_size);
 
     hwid_free_pool(mods, 'MIWH');
@@ -813,7 +814,7 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
         if (g_phys_addr_va && g_length_va) {
             hit = v;
             variant = vi;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] resolve_kernel_globals: pattern variant %d matched at offset 0x%llX\n",
                 vi, (UINT64)(v - (PUCHAR)nt_base));
             break;
@@ -821,7 +822,7 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     }
 
     if (!hit) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: no pattern match (tried %zu variants)\n",
             ARRAYSIZE(variants));
         return STATUS_NOT_FOUND;
@@ -835,7 +836,7 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     }
 
     if (!g_phys_addr_va || !g_length_va) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: bogus RIP-rel resolution\n");
         return STATUS_NOT_FOUND;
     }
@@ -845,7 +846,7 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     UINT64 nt_hi = nt_lo + nt_size;
     if (g_phys_addr_va < nt_lo || g_phys_addr_va >= nt_hi ||
         g_length_va    < nt_lo || g_length_va    >= nt_hi) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: globals outside ntoskrnl range\n");
         return STATUS_NOT_FOUND;
     }
@@ -858,13 +859,13 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
         phys = *(volatile UINT64*)g_phys_addr_va;
         len  = *(volatile ULONG*) g_length_va;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: SEH on global read\n");
         return STATUS_ACCESS_VIOLATION;
     }
 
     if (!phys || len < 0x10 || len > 0x20000) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: implausible phys=0x%llX len=0x%X\n",
             phys, len);
         return STATUS_INVALID_DEVICE_STATE;
@@ -879,14 +880,14 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     {
         ULONG check_size = (len > 512) ? 512 : (ULONG)len;
         if (check_size < 32) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] resolve_kernel_globals: table too small (%lu) at phys 0x%llX\n",
                 check_size, phys);
             return STATUS_INVALID_DEVICE_STATE;
         }
         UCHAR check_buf[512];
         if (!NT_SUCCESS(hwid_phys_read(phys, check_buf, check_size))) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] resolve_kernel_globals: read failed at phys 0x%llX\n", phys);
             return STATUS_ACCESS_VIOLATION;
         }
@@ -912,13 +913,13 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
         }
 
         if (!found_end || !found_type1) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] resolve_kernel_globals: content validation failed at phys 0x%llX "
                 "(found_end=%d found_type1=%d)\n", phys, (int)found_end, (int)found_type1);
             return STATUS_INVALID_DEVICE_STATE;
         }
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] resolve_kernel_globals: SMBIOS structure table validated at phys 0x%llX\n",
             phys);
     }
@@ -926,7 +927,7 @@ static NTSTATUS smbios_resolve_kernel_globals(UINT64* out_phys, SIZE_T* out_size
     *out_phys = phys;
     *out_size = (SIZE_T)len;
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
         "[HWID] resolved SMBIOS pool copy: phys=0x%llX len=0x%X\n", phys, len);
     return STATUS_SUCCESS;
 }
@@ -1014,7 +1015,7 @@ static NTSTATUS smbios_find_physical_by_signature(UINT64* out_phys, SIZE_T* out_
                     *out_phys = pa;
                     *out_size = sig_len;
                     result = STATUS_SUCCESS;
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                         "[HWID] Found SMBIOS table via signature scan at phys 0x%llX "
                         "(len=%lu)\n", pa, sig_len);
                     goto cleanup;
@@ -1049,7 +1050,7 @@ static NTSTATUS find_smbios_table(UINT64* out_phys, SIZE_T* out_size) {
     if (g_smbios_content_cache.valid) {
         st = smbios_find_physical_by_signature(out_phys, out_size);
         if (NT_SUCCESS(st)) return st;
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] find_smbios_table: signature scan failed, trying kernel globals\n");
     }
 
@@ -1063,7 +1064,7 @@ static NTSTATUS find_smbios_table(UINT64* out_phys, SIZE_T* out_size) {
             UCHAR verify[64];
             if (NT_SUCCESS(hwid_phys_read(*out_phys, verify, sizeof(verify)))) {
                 if (memcmp(verify, g_smbios_content_cache.data, sizeof(verify)) != 0) {
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                         "[HWID] find_smbios_table: kernel globals gave wrong content "
                         "(phys 0x%llX) — content mismatch with API data, rejecting!\n",
                         *out_phys);
@@ -1071,7 +1072,7 @@ static NTSTATUS find_smbios_table(UINT64* out_phys, SIZE_T* out_size) {
                     *out_size = 0;
                     return STATUS_INVALID_DEVICE_STATE;
                 }
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                     "[HWID] find_smbios_table: kernel globals content verified against API\n");
             }
         }
@@ -1205,7 +1206,7 @@ static NTSTATUS smbios_extract_hwid(PHWID_DATA out_data) {
                 memcpy(g_smbios_content_cache.data, table_buf, table_len);
                 g_smbios_content_cache.length = table_len;
                 g_smbios_content_cache.valid  = TRUE;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                     "[HWID] Cached %lu bytes of SMBIOS table for phys signature scan\n",
                     table_len);
             }
@@ -1213,7 +1214,7 @@ static NTSTATUS smbios_extract_hwid(PHWID_DATA out_data) {
         
         hwid_free_pool(table_buf, 'BIWS');
         if (NT_SUCCESS(st)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] SMBIOS extracted via API: uuid_present=%d serials_present=%d\n",
                 (out_data->components_present & HWID_COMPONENT_SMBIOS_UUID) ? 1 : 0,
                 (out_data->components_present & HWID_COMPONENT_SMBIOS_SERIALS) ? 1 : 0);
@@ -1226,7 +1227,7 @@ static NTSTATUS smbios_extract_hwid(PHWID_DATA out_data) {
     SIZE_T table_size = 0;
     st = find_smbios_table(&table_phys, &table_size);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] SMBIOS extraction: both API and phys scan failed\n");
+        KIPC_LOG( "[HWID] SMBIOS extraction: both API and phys scan failed\n");
         return st;
     }
 
@@ -1234,7 +1235,7 @@ static NTSTATUS smbios_extract_hwid(PHWID_DATA out_data) {
 
     // Defense-in-depth: re-validate table is in RAM before mapping
     if (!smbios_validate_table_in_ram(table_phys, table_size)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] smbios_extract_hwid: table at 0x%llX size %zu not in RAM, rejecting\n",
             table_phys, table_size);
         return STATUS_ACCESS_DENIED;
@@ -1249,7 +1250,7 @@ static NTSTATUS smbios_extract_hwid(PHWID_DATA out_data) {
     MmUnmapIoSpace(mapped, table_size);
 
     if (NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] SMBIOS extracted via phys fallback\n");
         return STATUS_SUCCESS;
     }
@@ -1346,10 +1347,12 @@ static VOID generate_spoofed_hwid(PHWID_DATA out_data, UINT64 seed, UINT32 compo
     if (seed) {
         xs128p_seed(seed);
     } else {
-        // Use KeQueryPerformanceCounter for seed
-        LARGE_INTEGER counter;
-        KeQueryPerformanceCounter(&counter);
-        xs128p_seed(counter.QuadPart ^ (UINT64)(ULONG_PTR)out_data);
+        // Use __rdtsc for seed.  KeQueryPerformanceCounter is not called
+        // anywhere during driver load on the KDU-mapped image, so its
+        // IAT slot can be left unresolved by the manual mapper and the
+        // first call bugchecks with an execute-AV at the file-time
+        // name-hint RVA.  __rdtsc is a CPU instruction — no IAT.
+        xs128p_seed(((UINT64)__rdtsc()) ^ (UINT64)(ULONG_PTR)out_data);
     }
 
     // Generate GUID characters: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
@@ -1431,7 +1434,7 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
 
     // Defense-in-depth: re-validate table is in RAM before mapping for write
     if (!smbios_validate_table_in_ram(table_phys, table_size)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] smbios_patch_hwid: table at 0x%llX size %zu not in RAM, rejecting\n",
             table_phys, table_size);
         return STATUS_ACCESS_DENIED;
@@ -1440,7 +1443,7 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
     // Backup entire table into pool memory — this is our restore point.
     st = hwid_backup_physical(table_phys, table_size);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Failed to backup SMBIOS table\n");
+        KIPC_LOG( "[HWID] Failed to backup SMBIOS table\n");
         return st;
     }
 
@@ -1453,14 +1456,14 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
         UCHAR verify[64];
         if (NT_SUCCESS(hwid_phys_read(table_phys, verify, sizeof(verify)))) {
             if (memcmp(verify, g_smbios_content_cache.data, sizeof(verify)) != 0) {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                     "[HWID] smbios_patch_hwid: CONTENT MISMATCH at phys 0x%llX — "
                     "wrong address! Aborting write to prevent corruption.\n",
                     table_phys);
                 hwid_restore_all_backups();
                 return STATUS_INVALID_DEVICE_STATE;
             }
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] smbios_patch_hwid: physical content verified against API cache\n");
         }
     }
@@ -1475,7 +1478,7 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
         // Don't leak the backup entry — hwid_backup_physical pushed one.
         // Clear it since we can't proceed.  On restore the array entry still
         // has valid data, so this is safe — we just won't have patched anything.
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] MmMapIoSpaceEx failed for SMBIOS patch (keeping backup)\n");
         // The backup is still valid; this just means patch didn't happen.
         // On restore, the original bytes will be written back (no-op restore).
@@ -1501,7 +1504,7 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
                 if (copy_len > 0) {
                     memcpy(sp, spoof_value, copy_len);
                     if (spoof_len < orig_len) sp[copy_len] = '\0';
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                         "[HWID] Patched serial string idx=%u (orig_len=%zu, copy=%zu)\n",
                         string_index, orig_len, copy_len);
                 }
@@ -1527,7 +1530,7 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
             // Patch UUID (if structure has it)
             if (hdr->Length >= 0x19 && (spoof_data->components_present & HWID_COMPONENT_SMBIOS_UUID)) {
                 memcpy(t1->Uuid, spoof_data->smbios_uuid, 16);
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] SMBIOS UUID patched\n");
+                KIPC_LOG( "[HWID] SMBIOS UUID patched\n");
             }
 
             // Patch system serial
@@ -1603,18 +1606,18 @@ static NTSTATUS smbios_patch_hwid(PHWID_DATA spoof_data) {
             RtlInitUnicodeString(&vn, L"SMBiosData");
             ms_st = ZwSetValueKey(hMs, &vn, 0, REG_BINARY, snap, (ULONG)table_size);
             ZwClose(hMs);
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] mssmbios SMBiosData write: 0x%X (%zu bytes)\n",
                 ms_st, table_size);
         } else {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] mssmbios key open failed: 0x%X (non-fatal)\n", ms_st);
         }
 
         hwid_free_pool(snap, 'NSWH');
     }
 
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID] SMBIOS physical table patched and unmapped\n");
+    KIPC_LOG( "[HWID] SMBIOS physical table patched and unmapped\n");
     return STATUS_SUCCESS;
 }
 
@@ -1657,7 +1660,7 @@ static NTSTATUS registry_capture_machineguid(PHWID_DATA out_data) {
 
     NTSTATUS st = ZwOpenKey(&hKey, KEY_READ, &oa);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] ZwOpenKey(Cryptography) failed: 0x%X\n", st);
+        KIPC_LOG( "[HWID] ZwOpenKey(Cryptography) failed: 0x%X\n", st);
         return st;
     }
 
@@ -1686,7 +1689,7 @@ static NTSTATUS registry_capture_machineguid(PHWID_DATA out_data) {
             memcpy(out_data->machine_guid, ansi_str.Buffer, copy_len);
             out_data->machine_guid[copy_len] = '\0';
             out_data->components_present |= HWID_COMPONENT_REGISTRY_MACHINEGUID;
-            DbgPrintEx(0x4d, 0xffffffff, "[HWID] Captured MachineGuid: %s\n", out_data->machine_guid);
+            KIPC_LOG( "[HWID] Captured MachineGuid: %s\n", out_data->machine_guid);
             RtlFreeAnsiString(&ansi_str);
             return STATUS_SUCCESS;
         }
@@ -1759,7 +1762,7 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
     HANDLE hClass = NULL;
     NTSTATUS st = ZwOpenKey(&hClass, KEY_READ, &oaClass);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] capture_mac: open class key failed 0x%X\n", st);
         return st;
     }
@@ -1863,7 +1866,7 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
                 out_data->components_present |= HWID_COMPONENT_MAC_ADDRESS;
                 ZwClose(hAdapter);
                 ZwClose(hClass);
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                     "[HWID] Captured MAC from PhysicalAddress (subkey %04u): %s (%s)\n",
                     idx, out_data->mac_address, desc);
                 return STATUS_SUCCESS;
@@ -1894,7 +1897,7 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
                 hwid_strncpy(out_data->mac_address, mac_buf, HWID_MAX_MAC_LEN);
             }
             out_data->components_present |= HWID_COMPONENT_MAC_ADDRESS;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] Captured MAC: %s (subkey %04u, %s)\n",
                 out_data->mac_address, idx, desc);
             got_mac = TRUE;
@@ -1905,7 +1908,7 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
 
     if (got_mac) return STATUS_SUCCESS;
 
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID] MAC capture: no physical adapter found\n");
+    KIPC_LOG( "[HWID] MAC capture: no physical adapter found\n");
     return STATUS_NOT_FOUND;
 }
 
@@ -1938,7 +1941,7 @@ static NTSTATUS capture_volume_serial(PHWID_DATA out_data) {
         if (NT_SUCCESS(st)) break;
     }
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] ZwCreateFile(C:) failed: 0x%X\n", st);
+        KIPC_LOG( "[HWID] ZwCreateFile(C:) failed: 0x%X\n", st);
         return st;
     }
 
@@ -1958,7 +1961,7 @@ static NTSTATUS capture_volume_serial(PHWID_DATA out_data) {
         hwid_format_vol_serial(out_data->volume_serial, HWID_MAX_VOLUME_LEN,
                                (UINT16)((serial >> 16) & 0xFFFF), (UINT16)(serial & 0xFFFF));
         out_data->components_present |= HWID_COMPONENT_VOLUME_SERIAL;
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Captured volume serial: %s\n", out_data->volume_serial);
+        KIPC_LOG( "[HWID] Captured volume serial: %s\n", out_data->volume_serial);
         return STATUS_SUCCESS;
     }
 
@@ -1997,7 +2000,7 @@ static NTSTATUS hwid_save_to_registry(PHWID_DATA data) {
     __try {
         st = ZwOpenKey(&hSoftware, KEY_CREATE_SUB_KEY, &oaSoftware);
         if (!NT_SUCCESS(st)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] hwid_save_to_registry: ZwOpenKey(SOFTWARE) failed 0x%X\n", st);
             return st;
         }
@@ -2014,7 +2017,7 @@ static NTSTATUS hwid_save_to_registry(PHWID_DATA data) {
             0, NULL, REG_OPTION_NON_VOLATILE, NULL);
         if (!NT_SUCCESS(st)) {
             ZwClose(hSoftware);
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] hwid_save_to_registry: ZwCreateKey(Scootware) failed 0x%X\n", st);
             return st;
         }
@@ -2032,7 +2035,7 @@ static NTSTATUS hwid_save_to_registry(PHWID_DATA data) {
         ZwClose(hScoot);
         if (!NT_SUCCESS(st)) {
             ZwClose(hSoftware);
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] hwid_save_to_registry: ZwCreateKey(HWID) failed 0x%X\n", st);
             return st;
         }
@@ -2046,11 +2049,11 @@ static NTSTATUS hwid_save_to_registry(PHWID_DATA data) {
         ZwClose(hSoftware);
 
         if (NT_SUCCESS(st)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                 "[HWID] Spoof data saved to registry (%zu bytes)\n", sizeof(HWID_DATA));
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
             "[HWID] hwid_save_to_registry: exception 0x%X\n", GetExceptionCode());
         if (hSoftware) ZwClose(hSoftware);
         return STATUS_UNSUCCESSFUL;
@@ -2085,7 +2088,7 @@ static NTSTATUS hwid_load_from_registry(PHWID_DATA out_data) {
     if (NT_SUCCESS(st) && kvpi->Type == REG_BINARY &&
         kvpi->DataLength >= sizeof(HWID_DATA)) {
         memcpy(out_data, kvpi->Data, sizeof(HWID_DATA));
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Spoof data loaded from registry\n");
+        KIPC_LOG( "[HWID] Spoof data loaded from registry\n");
         return STATUS_SUCCESS;
     }
 
@@ -2132,7 +2135,7 @@ namespace HWIDSpoofer {
         }
         ExReleaseFastMutex(&g_hwid_lock);
 
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Module initialized\n");
+        KIPC_LOG( "[HWID] Module initialized\n");
         return STATUS_SUCCESS;
     }
 
@@ -2151,7 +2154,7 @@ namespace HWIDSpoofer {
             g_hwid_state = HWID_STATE::HWID_STATE_UNINITIALIZED;
         }
         ExReleaseFastMutex(&g_hwid_lock);
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Module cleaned up\n");
+        KIPC_LOG( "[HWID] Module cleaned up\n");
     }
 
     BOOLEAN IsActive() {
@@ -2159,55 +2162,62 @@ namespace HWIDSpoofer {
     }
 
     NTSTATUS SaveOriginal() {
+        // Each capture_* routine below calls Zw* registry primitives (or
+        // NDIS / IOCTL paths via ObReferenceObjectByName) that require
+        // PASSIVE_LEVEL.  Holding g_hwid_lock (a fast mutex) across them
+        // raises IRQL to APC_LEVEL and BSODs the first Zw* call with
+        // IRQL_NOT_LESS_OR_EQUAL.  Capture into a local buffer outside
+        // the lock; flip the global state under the lock once we have
+        // a complete snapshot.
         NTSTATUS st = STATUS_SUCCESS;
+        HWID_DATA staged = {};
 
-        ExAcquireFastMutex(&g_hwid_lock);
-        {
-            RtlZeroMemory(&g_original_hwid, sizeof(g_original_hwid));
-
-            // Capture SMBIOS data
-            NTSTATUS smbios_st = smbios_extract_hwid(&g_original_hwid);
-            if (!NT_SUCCESS(smbios_st)) {
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] SMBIOS extraction failed: 0x%X\n", smbios_st);
-                st = smbios_st; // Non-fatal
-            }
-
-            // Capture MachineGuid
-            NTSTATUS guid_st = registry_capture_machineguid(&g_original_hwid);
-            if (!NT_SUCCESS(guid_st)) {
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] MachineGuid capture failed: 0x%X\n", guid_st);
-            }
-
-            // Capture MAC
-            NTSTATUS mac_st = capture_mac_address(&g_original_hwid);
-            if (!NT_SUCCESS(mac_st)) {
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] MAC capture failed: 0x%X\n", mac_st);
-            }
-
-            // Capture Volume Serial
-            NTSTATUS vol_st = capture_volume_serial(&g_original_hwid);
-            if (!NT_SUCCESS(vol_st)) {
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] Volume serial capture failed: 0x%X\n", vol_st);
-            }
-
-            // Timestamp
-            LARGE_INTEGER systime;
-            KeQuerySystemTime(&systime);
-            g_original_hwid.timestamp = systime.QuadPart;
-
-            if (g_original_hwid.components_present == 0) {
-                g_hwid_state = HWID_STATE::HWID_STATE_ERROR;
-                ExReleaseFastMutex(&g_hwid_lock);
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] SaveOriginal: NO components captured!\n");
-                return STATUS_UNSUCCESSFUL;
-            }
-
-            g_hwid_state = HWID_STATE::HWID_STATE_CAPTURED;
+        // Capture SMBIOS data — reads via NtQuerySystemInformation, safe
+        // at PASSIVE_LEVEL only.
+        NTSTATUS smbios_st = smbios_extract_hwid(&staged);
+        if (!NT_SUCCESS(smbios_st)) {
+            KIPC_LOG( "[HWID] SMBIOS extraction failed: 0x%X\n", smbios_st);
+            st = smbios_st; // Non-fatal — keep going
         }
+
+        // Capture MachineGuid via ZwOpenKey/ZwQueryValueKey.
+        NTSTATUS guid_st = registry_capture_machineguid(&staged);
+        if (!NT_SUCCESS(guid_st)) {
+            KIPC_LOG( "[HWID] MachineGuid capture failed: 0x%X\n", guid_st);
+        }
+
+        // Capture MAC — goes through NDIS, requires PASSIVE_LEVEL.
+        NTSTATUS mac_st = capture_mac_address(&staged);
+        if (!NT_SUCCESS(mac_st)) {
+            KIPC_LOG( "[HWID] MAC capture failed: 0x%X\n", mac_st);
+        }
+
+        // Capture Volume Serial — IRP path via storage stack, PASSIVE_LEVEL.
+        NTSTATUS vol_st = capture_volume_serial(&staged);
+        if (!NT_SUCCESS(vol_st)) {
+            KIPC_LOG( "[HWID] Volume serial capture failed: 0x%X\n", vol_st);
+        }
+
+        // Timestamp — safe at any IRQL but we take it here for ordering.
+        LARGE_INTEGER systime;
+        KeQuerySystemTime(&systime);
+        staged.timestamp = systime.QuadPart;
+
+        // Publish the captured snapshot under the lock.
+        ExAcquireFastMutex(&g_hwid_lock);
+        if (staged.components_present == 0) {
+            g_hwid_state = HWID_STATE::HWID_STATE_ERROR;
+            ExReleaseFastMutex(&g_hwid_lock);
+            KIPC_LOG( "[HWID] SaveOriginal: NO components captured!\n");
+            return STATUS_UNSUCCESSFUL;
+        }
+        memcpy(&g_original_hwid, &staged, sizeof(HWID_DATA));
+        g_hwid_state = HWID_STATE::HWID_STATE_CAPTURED;
         ExReleaseFastMutex(&g_hwid_lock);
 
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Original HWID saved (components=0x%X)\n",
-            g_original_hwid.components_present);
+        KIPC_LOG( "[HWID] Original HWID saved (components=0x%X)\n",
+            staged.components_present);
+        (void)st;
         return STATUS_SUCCESS;
     }
 
@@ -2233,146 +2243,215 @@ namespace HWIDSpoofer {
     NTSTATUS ApplySpoof(UINT32 components, UINT64 random_seed) {
         NTSTATUS result = STATUS_SUCCESS;
 
+        // ─── IRQL discipline ─────────────────────────────────────────────
+        // ExAcquireFastMutex raises IRQL to APC_LEVEL.  The registry
+        // primitives we use below (ZwOpenKey, ZwSetValueKey,
+        // ZwDeleteValueKey) are documented PASSIVE_LEVEL-only — calling
+        // them at APC_LEVEL bugchecks the box with IRQL_NOT_LESS_OR_EQUAL
+        // (0xA) on the first ZwOpenKey, which is exactly the BSOD the
+        // user reported on CMD_HWID_SPOOF.
+        //
+        // Strategy: hold the lock only across the in-memory state mutations
+        // (g_hwid_state checks, generate_spoofed_hwid, hwid_set_spoof_active,
+        // RtlZeroMemory on g_spoofed_hwid).  Drop it before ANY Zw* call.
+        // The state machine is simple enough that the small race window
+        // between drop and re-acquire is harmless — a concurrent ApplySpoof
+        // call would just write the same bytes twice.
+        // ────────────────────────────────────────────────────────────────
+
+        ExAcquireFastMutex(&g_hwid_lock);
+        if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
+            g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
+            ExReleaseFastMutex(&g_hwid_lock);
+            KIPC_LOG( "[HWID] ApplySpoof: not initialized\n");
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        BOOLEAN was_spoofed = hwid_is_spoof_active();
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // If already spoofed, RestoreOriginals first (it takes the lock
+        // internally; we are now at PASSIVE_LEVEL again).
+        if (was_spoofed) {
+            RestoreOriginals();
+        }
+
+        // Re-enter the protected region for the in-memory mutation.
         ExAcquireFastMutex(&g_hwid_lock);
         {
+            // Re-check state — RestoreOriginals could have raced with a
+            // concurrent Cleanup.  Bail cleanly if so.
             if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
                 g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
                 ExReleaseFastMutex(&g_hwid_lock);
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] ApplySpoof: not initialized\n");
                 return STATUS_INVALID_DEVICE_STATE;
-            }
-
-            // If already spoofed, restore first
-            if (hwid_is_spoof_active()) {
-                // Drop lock, call RestoreOriginals, then re-acquire
-                ExReleaseFastMutex(&g_hwid_lock);
-                RestoreOriginals();
-                ExAcquireFastMutex(&g_hwid_lock);
             }
 
             // Generate spoofed values
             generate_spoofed_hwid(&g_spoofed_hwid, random_seed, components);
 
             // ── Step 1: Apply SMBIOS physical memory patch (best-effort) ──
+            // GATED behind HWID_SPOOFER_PHYS_PATCH_ENABLED.  See hwid_spoofer.hpp
+            // for the failure modes that make this path BSOD on common Win10/11
+            // configurations.  When disabled, ApplySpoof falls through to the
+            // registry + (TODO) MSSMBIOS-pool patch which is BSOD-free.
+#if HWID_SPOOFER_PHYS_PATCH_ENABLED
             if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
                 NTSTATUS patch_st = smbios_patch_hwid(&g_spoofed_hwid);
                 if (!NT_SUCCESS(patch_st)) {
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                         "[HWID] SMBIOS physical patch failed: 0x%X (continuing with reg writes)\n", patch_st);
                     hwid_restore_all_backups();
                     // DON'T return — continue to write registry values
                 } else {
-                    DbgPrintEx(0x4d, 0xffffffff, "[HWID] SMBIOS physical patched OK\n");
+                    KIPC_LOG( "[HWID] SMBIOS physical patched OK\n");
                 }
             }
-
-            // ── Step 2: Write spoofed MachineGuid to registry ──
-            if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
-                HANDLE hKey = NULL;
-                UNICODE_STRING kp;
-                RtlInitUnicodeString(&kp,
-                    L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
-                OBJECT_ATTRIBUTES oa;
-                InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-                if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                    NTSTATUS ws = write_reg_string(&hKey, L"MachineGuid",
-                        g_spoofed_hwid.machine_guid);
-                    ZwClose(hKey);
-                    if (NT_SUCCESS(ws))
-                        DbgPrintEx(0x4d, 0xffffffff, "[HWID] MachineGuid registry written\n");
-                    else
-                        DbgPrintEx(0x4d, 0xffffffff, "[HWID] MachineGuid registry write failed: 0x%X\n", ws);
-                }
+#else
+            // Physical patch disabled — log once so the operator knows why
+            // SMBIOS values don't appear changed in WMI / dmidecode output.
+            if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
+                KIPC_LOG(
+                    "[HWID] SMBIOS physical patch SKIPPED (HWID_SPOOFER_PHYS_PATCH_ENABLED=0) — "
+                    "registry overrides still applied.  Anti-cheats querying the live SMBIOS "
+                    "table will see the original values; those that hit the registry-cached "
+                    "MSSMBIOS values (most do) will see the spoof.\n");
             }
-
-            // ── Step 3: Write spoofed MAC to registry (if we have one) ──
-            if ((components & HWID_COMPONENT_MAC_ADDRESS) && g_spoofed_hwid.mac_address[0]) {
-                static const WCHAR* mac_paths[] = {
-                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                    L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
-                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                    L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
-                };
-                for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
-                    HANDLE hKey = NULL;
-                    UNICODE_STRING kp;
-                    RtlInitUnicodeString(&kp, mac_paths[mi]);
-                    OBJECT_ATTRIBUTES oa;
-                    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-                    if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                        NTSTATUS ws = write_reg_string(&hKey, L"NetworkAddress",
-                            g_spoofed_hwid.mac_address);
-                        ZwClose(hKey);
-                        if (NT_SUCCESS(ws)) {
-                            DbgPrintEx(0x4d, 0xffffffff, "[HWID] MAC NetworkAddress written\n");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // ── Mark as spoofed ──
-            hwid_set_spoof_active();
-            g_hwid_state = HWID_STATE::HWID_STATE_SPOOFED;
-
-            // Persist spoofed data to registry so it survives driver reloads
-            hwid_save_to_registry(&g_spoofed_hwid);
+#endif
         }
+        // ─── Drop the lock BEFORE any Zw* registry call ──────────────────
+        // Snapshot the spoofed values we need into stack locals so the
+        // unprotected window below can't see torn writes from a concurrent
+        // ApplySpoof.  CHAR arrays are small enough to copy cheaply.
+        CHAR snap_machine_guid[HWID_MAX_GUID_LEN];
+        CHAR snap_mac_address [HWID_MAX_MAC_LEN];
+        memcpy(snap_machine_guid, g_spoofed_hwid.machine_guid, HWID_MAX_GUID_LEN);
+        memcpy(snap_mac_address,  g_spoofed_hwid.mac_address,  HWID_MAX_MAC_LEN);
         ExReleaseFastMutex(&g_hwid_lock);
 
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Spoof applied (components=0x%X)\n", components);
-        return result;
-    }
+        // ── Step 2: Write spoofed MachineGuid to registry (PASSIVE_LEVEL) ──
+        if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
+            HANDLE hKey = NULL;
+            UNICODE_STRING kp;
+            RtlInitUnicodeString(&kp,
+                L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
-    NTSTATUS RestoreOriginals() {
-        ExAcquireFastMutex(&g_hwid_lock);
-        {
-            if (!hwid_is_spoof_active()) {
-                ExReleaseFastMutex(&g_hwid_lock);
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] RestoreOriginals: not spoofed\n");
-                return STATUS_SUCCESS;
+            if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
+                NTSTATUS ws = write_reg_string(&hKey, L"MachineGuid", snap_machine_guid);
+                ZwClose(hKey);
+                if (NT_SUCCESS(ws))
+                    KIPC_LOG( "[HWID] MachineGuid registry written\n");
+                else
+                    KIPC_LOG( "[HWID] MachineGuid registry write failed: 0x%X\n", ws);
             }
+        }
 
-            // Restore physical memory patches
-            hwid_restore_all_backups();
-
-            // Restore MachineGuid in registry
-            if (g_original_hwid.machine_guid[0]) {
-                HANDLE hKey = NULL;
-                UNICODE_STRING kp;
-                RtlInitUnicodeString(&kp,
-                    L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
-                OBJECT_ATTRIBUTES oa;
-                InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-                if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                    write_reg_string(&hKey, L"MachineGuid", g_original_hwid.machine_guid);
-                    ZwClose(hKey);
-                    DbgPrintEx(0x4d, 0xffffffff, "[HWID] MachineGuid restored in registry\n");
-                }
-            }
-
-            // Remove NetworkAddress override (delete it so hardware MAC is used again)
-            static const WCHAR* rst_mac[] = {
+        // ── Step 3: Write spoofed MAC to registry (PASSIVE_LEVEL) ──
+        if ((components & HWID_COMPONENT_MAC_ADDRESS) && snap_mac_address[0]) {
+            static const WCHAR* mac_paths[] = {
                 L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
                 L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
                 L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
                 L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
             };
-            for (int mi = 0; mi < ARRAYSIZE(rst_mac); mi++) {
+            for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
                 HANDLE hKey = NULL;
-                UNICODE_STRING kp2;
-                RtlInitUnicodeString(&kp2, rst_mac[mi]);
-                OBJECT_ATTRIBUTES oa2;
-                InitializeObjectAttributes(&oa2, &kp2, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-                if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa2))) {
-                    UNICODE_STRING vn;
-                    RtlInitUnicodeString(&vn, L"NetworkAddress");
-                    ZwDeleteValueKey(hKey, &vn);
+                UNICODE_STRING kp;
+                RtlInitUnicodeString(&kp, mac_paths[mi]);
+                OBJECT_ATTRIBUTES oa;
+                InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+                if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
+                    NTSTATUS ws = write_reg_string(&hKey, L"NetworkAddress", snap_mac_address);
                     ZwClose(hKey);
+                    if (NT_SUCCESS(ws)) {
+                        KIPC_LOG( "[HWID] MAC NetworkAddress written\n");
+                        break;
+                    }
                 }
             }
+        }
+
+        // ── Mark as spoofed + persist (re-acquire briefly for state flip) ──
+        ExAcquireFastMutex(&g_hwid_lock);
+        hwid_set_spoof_active();
+        g_hwid_state = HWID_STATE::HWID_STATE_SPOOFED;
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // Persist spoofed data to registry so it survives driver reloads.
+        // hwid_save_to_registry also issues Zw* calls — keep it OUTSIDE the
+        // lock for the same IRQL reason.
+        hwid_save_to_registry(&g_spoofed_hwid);
+
+        KIPC_LOG( "[HWID] Spoof applied (components=0x%X)\n", components);
+        return result;
+    }
+
+    NTSTATUS RestoreOriginals() {
+        // Same IRQL discipline as ApplySpoof: do all Zw* calls outside the
+        // fast mutex (which raises to APC_LEVEL).  See ApplySpoof for the
+        // detailed rationale — the BSOD this guards against is IRQL_NOT_
+        // LESS_OR_EQUAL on the first ZwOpenKey while the lock is held.
+
+        ExAcquireFastMutex(&g_hwid_lock);
+        if (!hwid_is_spoof_active()) {
+            ExReleaseFastMutex(&g_hwid_lock);
+            KIPC_LOG( "[HWID] RestoreOriginals: not spoofed\n");
+            return STATUS_SUCCESS;
+        }
+
+        // Restore physical memory patches under the lock — these touch
+        // pool-resident backup buffers and don't issue Zw* calls.
+#if HWID_SPOOFER_PHYS_PATCH_ENABLED
+        hwid_restore_all_backups();
+#endif
+
+        // Snapshot the original MachineGuid for the registry write below,
+        // then drop the lock before any Zw* call.
+        CHAR snap_orig_guid[HWID_MAX_GUID_LEN];
+        memcpy(snap_orig_guid, g_original_hwid.machine_guid, HWID_MAX_GUID_LEN);
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // Restore MachineGuid in registry (PASSIVE_LEVEL).
+        if (snap_orig_guid[0]) {
+            HANDLE hKey = NULL;
+            UNICODE_STRING kp;
+            RtlInitUnicodeString(&kp,
+                L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+            if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
+                write_reg_string(&hKey, L"MachineGuid", snap_orig_guid);
+                ZwClose(hKey);
+                KIPC_LOG( "[HWID] MachineGuid restored in registry\n");
+            }
+        }
+
+        // Remove NetworkAddress override (delete it so hardware MAC is used again)
+        static const WCHAR* rst_mac[] = {
+            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
+            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
+        };
+        for (int mi = 0; mi < ARRAYSIZE(rst_mac); mi++) {
+            HANDLE hKey = NULL;
+            UNICODE_STRING kp2;
+            RtlInitUnicodeString(&kp2, rst_mac[mi]);
+            OBJECT_ATTRIBUTES oa2;
+            InitializeObjectAttributes(&oa2, &kp2, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+            if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa2))) {
+                UNICODE_STRING vn;
+                RtlInitUnicodeString(&vn, L"NetworkAddress");
+                ZwDeleteValueKey(hKey, &vn);
+                ZwClose(hKey);
+            }
+        }
+
+        // Final state flip under the lock.
+        ExAcquireFastMutex(&g_hwid_lock);
+        {
 
             RtlZeroMemory(&g_spoofed_hwid, sizeof(g_spoofed_hwid));
             hwid_clear_spoof_active();
@@ -2380,7 +2459,7 @@ namespace HWIDSpoofer {
         }
         ExReleaseFastMutex(&g_hwid_lock);
 
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Originals restored\n");
+        KIPC_LOG( "[HWID] Originals restored\n");
         return STATUS_SUCCESS;
     }
 
@@ -2391,96 +2470,133 @@ namespace HWIDSpoofer {
         if (!NT_SUCCESS(st) && st != STATUS_SUCCESS) {
             // RestoreOriginals returns SUCCESS even if not spoofed
         }
-        // Force a unique seed using high-res timer + cycle counter
-        LARGE_INTEGER counter;
-        KeQueryPerformanceCounter(&counter);
-        UINT64 seed = counter.QuadPart ^ __readpmc(0) ^ (UINT64)(ULONG_PTR)&g_spoofed_hwid;
+
+        // Build a unique seed from __rdtsc only — a CPU instruction
+        // with no IAT dependency.  The previous revision mixed
+        // KeQueryPerformanceCounter and KeQueryInterruptTime in here,
+        // but both are imports that KDU's manual mapper has been
+        // observed to leave unresolved (they're not called anywhere
+        // during driver load), and the first call bugchecks with an
+        // execute-AV at the unresolved file-time RVA.
+        //
+        // We take two TSC samples separated by a volatile scramble so
+        // the second sample reflects a distinct point even when the
+        // CPU pipeline collapses them.  Mixing in g_spoofed_hwid's
+        // address adds a kernel-pool entropy bit.
+        ULONG64 tsc1 = __rdtsc();
+        volatile ULONG64 scramble = tsc1 * 0xBF58476D1CE4E5B9ULL;
+        scramble ^= scramble >> 27;
+        ULONG64 tsc2 = __rdtsc();
+        UINT64 seed = tsc1
+                    ^ (tsc2 * 0x9E3779B97F4A7C15ULL)
+                    ^ scramble
+                    ^ (UINT64)(ULONG_PTR)&g_spoofed_hwid;
         return ApplySpoof(components, seed);
     }
 
     NTSTATUS ApplyCustom(PHWID_DATA data, UINT32 components) {
         if (!data) return STATUS_INVALID_PARAMETER;
 
+        // Same IRQL discipline as ApplySpoof.  See that function for the
+        // full rationale on why every Zw* call below must happen with the
+        // fast mutex released.
+
         ExAcquireFastMutex(&g_hwid_lock);
-        {
-            if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
-                g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
-                ExReleaseFastMutex(&g_hwid_lock);
-                DbgPrintEx(0x4d, 0xffffffff, "[HWID] ApplyCustom: not initialized\n");
-                return STATUS_INVALID_DEVICE_STATE;
+        if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
+            g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
+            ExReleaseFastMutex(&g_hwid_lock);
+            KIPC_LOG( "[HWID] ApplyCustom: not initialized\n");
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        BOOLEAN was_spoofed = hwid_is_spoof_active();
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // If already spoofed, RestoreOriginals first (PASSIVE_LEVEL).
+        if (was_spoofed) {
+            RestoreOriginals();
+        }
+
+        // Stage the custom payload into our spoofed slot under the lock.
+        ExAcquireFastMutex(&g_hwid_lock);
+        if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
+            g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
+            ExReleaseFastMutex(&g_hwid_lock);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        RtlZeroMemory(&g_spoofed_hwid, sizeof(g_spoofed_hwid));
+        memcpy(&g_spoofed_hwid, data, sizeof(HWID_DATA));
+        g_spoofed_hwid.components_present = components;
+
+#if HWID_SPOOFER_PHYS_PATCH_ENABLED
+        if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
+            NTSTATUS st = smbios_patch_hwid(&g_spoofed_hwid);
+            if (!NT_SUCCESS(st)) {
+                KIPC_LOG( "[HWID] ApplyCustom SMBIOS patch failed: 0x%X (continuing)\n", st);
+                hwid_restore_all_backups();
             }
+        }
+#else
+        if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
+            KIPC_LOG(
+                "[HWID] ApplyCustom SMBIOS physical patch SKIPPED — registry path only\n");
+        }
+#endif
 
-            // If already spoofed, restore first
-            if (hwid_is_spoof_active()) {
-                ExReleaseFastMutex(&g_hwid_lock);
-                RestoreOriginals();
-                ExAcquireFastMutex(&g_hwid_lock);
+        // Snapshot the strings we need for the registry writes, then drop
+        // the lock before any Zw* call.
+        CHAR snap_guid[HWID_MAX_GUID_LEN];
+        CHAR snap_mac [HWID_MAX_MAC_LEN];
+        memcpy(snap_guid, g_spoofed_hwid.machine_guid, HWID_MAX_GUID_LEN);
+        memcpy(snap_mac,  g_spoofed_hwid.mac_address,  HWID_MAX_MAC_LEN);
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // ── Registry writes at PASSIVE_LEVEL ──
+        if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
+            HANDLE hKey = NULL;
+            UNICODE_STRING kp;
+            RtlInitUnicodeString(&kp,
+                L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+            if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
+                write_reg_string(&hKey, L"MachineGuid", snap_guid);
+                ZwClose(hKey);
+                KIPC_LOG( "[HWID] ApplyCustom: MachineGuid written\n");
             }
+        }
 
-            // Copy custom data directly into spoofed HWID (no random generation)
-            RtlZeroMemory(&g_spoofed_hwid, sizeof(g_spoofed_hwid));
-            memcpy(&g_spoofed_hwid, data, sizeof(HWID_DATA));
-
-            // Ensure components_present reflects what we're actually applying
-            g_spoofed_hwid.components_present = components;
-
-            // ── Step 1: Apply SMBIOS physical patch (best-effort) ──
-            if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
-                NTSTATUS st = smbios_patch_hwid(&g_spoofed_hwid);
-                if (!NT_SUCCESS(st)) {
-                    DbgPrintEx(0x4d, 0xffffffff, "[HWID] ApplyCustom SMBIOS patch failed: 0x%X (continuing)\n", st);
-                    hwid_restore_all_backups();
-                    // DON'T return — continue with registry writes
-                }
-            }
-
-            // ── Step 2: Write MachineGuid to registry ──
-            if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
+        if ((components & HWID_COMPONENT_MAC_ADDRESS) && snap_mac[0]) {
+            static const WCHAR* mac_paths[] = {
+                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
+                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
+            };
+            for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
                 HANDLE hKey = NULL;
                 UNICODE_STRING kp;
-                RtlInitUnicodeString(&kp,
-                    L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
+                RtlInitUnicodeString(&kp, mac_paths[mi]);
                 OBJECT_ATTRIBUTES oa;
                 InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
                 if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                    write_reg_string(&hKey, L"MachineGuid", g_spoofed_hwid.machine_guid);
+                    write_reg_string(&hKey, L"NetworkAddress", snap_mac);
                     ZwClose(hKey);
-                    DbgPrintEx(0x4d, 0xffffffff, "[HWID] ApplyCustom: MachineGuid written\n");
+                    KIPC_LOG( "[HWID] ApplyCustom: MAC written\n");
+                    break;
                 }
             }
-
-            // ── Step 3: Write MAC to registry ──
-            if ((components & HWID_COMPONENT_MAC_ADDRESS) && g_spoofed_hwid.mac_address[0]) {
-                static const WCHAR* mac_paths[] = {
-                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                    L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
-                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                    L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
-                };
-                for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
-                    HANDLE hKey = NULL;
-                    UNICODE_STRING kp;
-                    RtlInitUnicodeString(&kp, mac_paths[mi]);
-                    OBJECT_ATTRIBUTES oa;
-                    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-                    if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                        write_reg_string(&hKey, L"NetworkAddress", g_spoofed_hwid.mac_address);
-                        ZwClose(hKey);
-                        DbgPrintEx(0x4d, 0xffffffff, "[HWID] ApplyCustom: MAC written\n");
-                        break;
-                    }
-                }
-            }
-
-            hwid_set_spoof_active();
-            g_hwid_state = HWID_STATE::HWID_STATE_SPOOFED;
-
-            // Persist to registry
-            hwid_save_to_registry(&g_spoofed_hwid);
         }
+
+        // Final state flip.
+        ExAcquireFastMutex(&g_hwid_lock);
+        hwid_set_spoof_active();
+        g_hwid_state = HWID_STATE::HWID_STATE_SPOOFED;
         ExReleaseFastMutex(&g_hwid_lock);
 
-        DbgPrintEx(0x4d, 0xffffffff, "[HWID] Custom spoof applied (components=0x%X)\n", components);
+        // Persist (outside lock — issues Zw* calls).
+        hwid_save_to_registry(&g_spoofed_hwid);
+
+        KIPC_LOG( "[HWID] Custom spoof applied (components=0x%X)\n", components);
         return STATUS_SUCCESS;
     }
 
@@ -2492,11 +2608,15 @@ namespace HWIDSpoofer {
     }
 
     NTSTATUS SaveToDisk() {
+        // hwid_save_to_registry issues Zw* calls and must run at
+        // PASSIVE_LEVEL.  Snapshot the relevant struct under the lock,
+        // release, then persist.
+        HWID_DATA snap;
         ExAcquireFastMutex(&g_hwid_lock);
         PHWID_DATA src = hwid_is_spoof_active() ? &g_spoofed_hwid : &g_original_hwid;
-        NTSTATUS st = hwid_save_to_registry(src);
+        memcpy(&snap, src, sizeof(HWID_DATA));
         ExReleaseFastMutex(&g_hwid_lock);
-        return st;
+        return hwid_save_to_registry(&snap);
     }
 
     NTSTATUS LoadFromDisk(PHWID_DATA out_data) {

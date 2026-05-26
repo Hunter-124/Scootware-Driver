@@ -169,6 +169,38 @@ class DriverClient:
         except DriverError:
             return False
 
+    # Fields encoded as hex by the helper (no 0x prefix).
+    _STEALTH_HEX_FIELDS = frozenset({
+        "cave_address",
+        "cave_module_base",
+        "ret_gadget_address",
+        "ret_gadget_module_base",
+        "target_cr3",
+        "target_base",
+    })
+    # Fields encoded as decimal integers by the helper.
+    _STEALTH_INT_FIELDS = frozenset({
+        "thread_spoof_active", "cave_size", "stack_isolation_active",
+        "expanded_stack_size", "kpti_enabled", "cr3_swap_capable",
+        "cr3_mode", "ntfvm_ssn", "ssn_resolved_dynamic", "ssn_resolution_path",
+        "worker_count", "discovery_active", "target_attached", "target_pid",
+    })
+
+    def get_stealth_status(self) -> dict:
+        try:
+            kvs = self._send("stealth")
+            res = {}
+            for k, v in kvs.items():
+                if k in self._STEALTH_HEX_FIELDS:
+                    res[k] = int(v, 16)
+                elif k in self._STEALTH_INT_FIELDS:
+                    res[k] = int(v)
+                else:
+                    res[k] = v
+            return res
+        except DriverError as e:
+            raise DriverError(f"get_stealth_status failed: {e}") from e
+
     # ── Process discovery ──────────────────────────────────────────────
     def get_pid_by_name(self, process_name: str) -> int:
         if not process_name or len(process_name) > 255:

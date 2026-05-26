@@ -75,6 +75,7 @@
 #include <ntifs.h>
 #include <ntimage.h>
 #include <intrin.h>
+#include "kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
 // Forward declarations — these live in driver.cpp and thread_spoof.h
 PVOID GetSystemModuleBase(const char *module_name);
@@ -125,6 +126,10 @@ static const SSN_ENTRY g_ssn_table[] = {
 // Minimal LDR table entry used only for the PEB walk — not used; removed.
 // Instead, we resolve ntdll via the kernel module list.
 
+// Diagnostic — set by ResolveNtFreeVirtualMemorySyscall at each exit point.
+// See IPC_STEALTH_STATUS::ssn_resolution_path for the enum legend.
+static ULONG g_NtFreeVirtualMemoryResolutionPath = 0;
+
 __forceinline ULONG ResolveNtFreeVirtualMemorySyscall() {
     // Use SystemModuleInformation to find ntdll.dll's kernel VA.
     ULONG bytes = 0;
@@ -133,99 +138,385 @@ __forceinline ULONG ResolveNtFreeVirtualMemorySyscall() {
 
     NTSTATUS st = ZwQuerySystemInformation(SystemModuleInformation,
                                             nullptr, 0, &bytes);
-    if (!bytes) goto fallback_static;
+    if (!bytes) {
+        g_NtFreeVirtualMemoryResolutionPath = 2; // ZwQSI failed
+        goto fallback_static;
+    }
 
     pMods = (PRTL_PROCESS_MODULES)ExAllocatePool(NonPagedPool, bytes);
-    if (!pMods) goto fallback_static;
+    if (!pMods) {
+        g_NtFreeVirtualMemoryResolutionPath = 3; // ExAllocatePool failed
+        goto fallback_static;
+    }
 
     st = ZwQuerySystemInformation(SystemModuleInformation, pMods, bytes, &bytes);
     if (!NT_SUCCESS(st)) {
         ExFreePool(pMods);
+        g_NtFreeVirtualMemoryResolutionPath = 2; // ZwQSI failed on fill
         goto fallback_static;
     }
 
     ntdllBase = nullptr;
-    for (ULONG i = 0; i < pMods->NumberOfModules; i++) {
-        // The module name in FullPathName; ntdll.dll always maps as
-        // \KnownDlls\ntdll.dll or \SystemRoot\System32\ntdll.dll
-        const char* path = (const char*)pMods->Modules[i].FullPathName;
-        SIZE_T pathLen = 0;
-        while (path[pathLen]) pathLen++;
+    // The kernel module table is conveniently shaped: each entry's
+    // OffsetToFileName points at the start of the filename portion of
+    // FullPathName (i.e., just past the last '\\').  Match against that
+    // directly — earlier revisions computed pathLen and did a suffix match
+    // with a literal length, which had an off-by-one bug
+    // (needLen was 8 but strlen("ntdll.dll") == 9) that prevented the
+    // resolver from ever finding ntdll.  Using OffsetToFileName avoids
+    // the entire length-math hazard and is also what every other
+    // SystemModuleInformation consumer in the WDK samples does.
+    {
+        const char* needName = "ntdll.dll";
+        const SIZE_T needLen = 9; // strlen("ntdll.dll")
+        for (ULONG i = 0; i < pMods->NumberOfModules; i++) {
+            auto& mod = pMods->Modules[i];
+            USHORT ofs = mod.OffsetToFileName;
+            if (ofs >= sizeof(mod.FullPathName)) continue; // malformed entry
+            const char* fname = (const char*)&mod.FullPathName[ofs];
 
-        // Suffix match "ntdll.dll" (case-insensitive)
-        const char* need = "ntdll.dll";
-        SIZE_T needLen = 8; // strlen("ntdll.dll") == 8
-        if (pathLen >= needLen) {
+            // Length-bounded case-insensitive compare against "ntdll.dll\0".
+            // We require an exact-length match (the +1 picks up the NUL),
+            // not a prefix match, so "ntdll.dll.mui" wouldn't false-positive.
             BOOLEAN match = TRUE;
-            for (SIZE_T j = 0; j < needLen; j++) {
-                char a = path[pathLen - needLen + j];
-                char b = need[j];
-                if (a >= 'A' && a <= 'Z') a += 32;
-                if (b >= 'A' && b <= 'Z') b += 32;
+            for (SIZE_T j = 0; j < needLen + 1; j++) {
+                char a = fname[j];
+                char b = needName[j];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
                 if (a != b) { match = FALSE; break; }
             }
             if (match) {
-                ntdllBase = pMods->Modules[i].ImageBase;
+                ntdllBase = mod.ImageBase;
                 break;
             }
         }
     }
     ExFreePool(pMods);
 
-    if (!ntdllBase) goto fallback_static;
+    if (!ntdllBase) {
+        g_NtFreeVirtualMemoryResolutionPath = 4; // ntdll not in module list
+        goto fallback_static;
+    }
 
     // Parse PE export table to find NtFreeVirtualMemory's stub.
+    //
+    // Wrapped in SEH because ntdll's kernel mapping has pageable sections —
+    // touching a paged-out byte raises an in-page error that, uncaught,
+    // bugchecks the box with KMODE_EXCEPTION_NOT_HANDLED.  All probe
+    // accesses live inside the __try; we fall through to the static table
+    // on any fault.  We also bounds-check ords[i] against NumberOfFunctions
+    // to refuse a malformed export directory rather than walking off the
+    // end of the funcs array.
     {
-        auto* pDos = (PIMAGE_DOS_HEADER)ntdllBase;
-        if (pDos->e_magic != IMAGE_DOS_SIGNATURE) goto fallback_static;
-        auto* pNt = (PIMAGE_NT_HEADERS)((PUCHAR)ntdllBase + pDos->e_lfanew);
-        if (pNt->Signature != IMAGE_NT_SIGNATURE) goto fallback_static;
-        auto& expDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (!expDir.VirtualAddress || !expDir.Size) goto fallback_static;
+        ULONG ssn_found = 0;
+        ULONG inner_path = 0;
+        __try {
+            auto* pDos = (PIMAGE_DOS_HEADER)ntdllBase;
+            if (pDos->e_magic != IMAGE_DOS_SIGNATURE) { inner_path = 5; __leave; }
+            auto* pNt = (PIMAGE_NT_HEADERS)((PUCHAR)ntdllBase + pDos->e_lfanew);
+            if (pNt->Signature != IMAGE_NT_SIGNATURE) { inner_path = 5; __leave; }
+            auto& expDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (!expDir.VirtualAddress || !expDir.Size) { inner_path = 5; __leave; }
 
-        auto* pExport = (PIMAGE_EXPORT_DIRECTORY)((PUCHAR)ntdllBase + expDir.VirtualAddress);
-        auto* names   = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfNames);
-        auto* ords    = (PUSHORT)((PUCHAR)ntdllBase + pExport->AddressOfNameOrdinals);
-        auto* funcs   = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfFunctions);
+            auto* pExport = (PIMAGE_EXPORT_DIRECTORY)((PUCHAR)ntdllBase + expDir.VirtualAddress);
+            auto* names   = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfNames);
+            auto* ords    = (PUSHORT)((PUCHAR)ntdllBase + pExport->AddressOfNameOrdinals);
+            auto* funcs   = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfFunctions);
+            const ULONG numNames = pExport->NumberOfNames;
+            const ULONG numFuncs = pExport->NumberOfFunctions;
 
-        for (ULONG i = 0; i < pExport->NumberOfNames; i++) {
-            const char* fnName = (const char*)((PUCHAR)ntdllBase + names[i]);
-            if (strcmp(fnName, "NtFreeVirtualMemory") == 0) {
-                PUCHAR fnAddr = (PUCHAR)ntdllBase + funcs[ords[i]];
-                // x64 syscall stub:  4C 8B D1  mov r10,rcx ; B8 XX XX 00 00  mov eax,SSN
-                if (fnAddr[0] == 0x4C && fnAddr[1] == 0x8B &&
-                    fnAddr[2] == 0xD1 && fnAddr[3] == 0xB8) {
-                    ULONG ssn = *(PULONG)(fnAddr + 4);
-                    if (ssn > 0 && ssn < 0x400) {
-                        DbgPrintEx(0x4d, 0xffffffff,
-                                   "[CR3-IPC] SyscallSpf: NtFreeVirtualMemory SSN=%lu (dynamic)\n", ssn);
-                        return ssn;
+            BOOLEAN found_export = FALSE;
+            for (ULONG i = 0; i < numNames; i++) {
+                const char* fnName = (const char*)((PUCHAR)ntdllBase + names[i]);
+                if (strcmp(fnName, "NtFreeVirtualMemory") == 0) {
+                    found_export = TRUE;
+                    USHORT fnOrd = ords[i];
+                    if (fnOrd >= numFuncs) { inner_path = 7; break; }
+                    PUCHAR fnAddr = (PUCHAR)ntdllBase + funcs[fnOrd];
+
+                    // Skip CET ENDBR64 prologue (F3 0F 1E FA) if present.
+                    // Newer ntdll builds with CET enabled prepend ENDBR64
+                    // before the standard syscall stub; classic Win10 builds
+                    // start directly with the 4C 8B D1 / B8 SSN sequence.
+                    if (fnAddr[0] == 0xF3 && fnAddr[1] == 0x0F &&
+                        fnAddr[2] == 0x1E && fnAddr[3] == 0xFA) {
+                        fnAddr += 4;
                     }
+
+                    // x64 syscall stub:  4C 8B D1  mov r10,rcx ; B8 XX XX 00 00  mov eax,SSN
+                    if (fnAddr[0] == 0x4C && fnAddr[1] == 0x8B &&
+                        fnAddr[2] == 0xD1 && fnAddr[3] == 0xB8) {
+                        ULONG ssn = *(PULONG)(fnAddr + 4);
+                        if (ssn > 0 && ssn < 0x400) {
+                            ssn_found = ssn;
+                            inner_path = 1; // dynamic OK
+                        } else {
+                            inner_path = 7; // bad SSN range
+                        }
+                    } else {
+                        inner_path = 7; // stub bytes didn't match
+                    }
+                    break;
                 }
-                break;
             }
+            if (!found_export && inner_path == 0) {
+                inner_path = 6; // PE OK but export missing
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ssn_found = 0;
+            inner_path = 5; // PE walk faulted
         }
+        if (ssn_found) {
+            g_NtFreeVirtualMemoryResolutionPath = inner_path; // 1
+            KIPC_LOG(
+                       "[CR3-IPC] SyscallSpf: NtFreeVirtualMemory SSN=%lu (dynamic)\n", ssn_found);
+            return ssn_found;
+        }
+        g_NtFreeVirtualMemoryResolutionPath = inner_path; // 5/6/7
     }
 
 fallback_static:
 
-    // Static fallback by OS build
-    RTL_OSVERSIONINFOW ver = {};
-    RtlGetVersion(&ver);
-    for (ULONG i = 0; i < SSN_TABLE_COUNT; i++) {
-        if (ver.dwBuildNumber >= g_ssn_table[i].build_low &&
-            ver.dwBuildNumber <= g_ssn_table[i].build_high) {
-            DbgPrintEx(0x4d, 0xffffffff,
-                       "[CR3-IPC] SyscallSpf: NtFreeVirtualMemory SSN=0x%X (static, build %lu)\n",
-                       g_ssn_table[i].ssn, ver.dwBuildNumber);
-            return g_ssn_table[i].ssn;
+    // Static fallback by OS build.
+    //
+    // Resolve RtlGetVersion via MmGetSystemRoutineAddress instead of
+    // calling it through the IAT.  RtlGetVersion is one of those
+    // imports KDU's manual mapper leaves unresolved when the original
+    // driver never calls it during load (we only call it from
+    // get_winver() which is in IPC paths) — calling through an
+    // unresolved IAT slot bugchecks with an execute-AV at the
+    // file-time name-hint RVA.  MmGetSystemRoutineAddress IS resolved
+    // (every KDU mapper handles the core kernel exports) so this
+    // sidesteps the issue.
+    {
+        typedef NTSTATUS (NTAPI *fn_RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+        UNICODE_STRING rgvName;
+        RtlInitUnicodeString(&rgvName, L"RtlGetVersion");
+        auto pfnRtlGetVersion =
+            (fn_RtlGetVersion_t)MmGetSystemRoutineAddress(&rgvName);
+
+        if (pfnRtlGetVersion) {
+            RTL_OSVERSIONINFOW ver = {};
+            ver.dwOSVersionInfoSize = sizeof(ver);
+            pfnRtlGetVersion(&ver);
+            for (ULONG i = 0; i < SSN_TABLE_COUNT; i++) {
+                if (ver.dwBuildNumber >= g_ssn_table[i].build_low &&
+                    ver.dwBuildNumber <= g_ssn_table[i].build_high) {
+                    // Don't overwrite a more-specific dynamic-failure path code
+                    // (5/6/7) — only fill in 8 if we got all the way here
+                    // cleanly without dynamic-side diagnostics.
+                    if (g_NtFreeVirtualMemoryResolutionPath == 0)
+                        g_NtFreeVirtualMemoryResolutionPath = 8;
+                    KIPC_LOG(
+                               "[CR3-IPC] SyscallSpf: NtFreeVirtualMemory SSN=0x%X (static, build %lu)\n",
+                               g_ssn_table[i].ssn, ver.dwBuildNumber);
+                    return g_ssn_table[i].ssn;
+                }
+            }
+            // Fell out of static range — flag as path 9 below.
+            if (g_NtFreeVirtualMemoryResolutionPath == 0)
+                g_NtFreeVirtualMemoryResolutionPath = 9;
+        } else {
+            // Couldn't dynamically resolve RtlGetVersion either — flag path 10.
+            g_NtFreeVirtualMemoryResolutionPath = 10;
         }
     }
 
-    DbgPrintEx(0x4d, 0xffffffff,
-               "[CR3-IPC] SyscallSpf: WARNING — unknown build %lu, using 0x1F\n",
-               ver.dwBuildNumber);
+    KIPC_LOG(
+               "[CR3-IPC] SyscallSpf: WARNING — RtlGetVersion unresolved or "
+               "build unknown, using 0x1F\n");
     return 0x1F; // Best guess: latest known SSN
+}
+
+// ============================================================================
+// Target-process SSN resolver
+//
+// SystemModuleInformation only enumerates KERNEL-mode loaded modules
+// (PsLoadedModuleList) — ntdll.dll is NOT in that list on Win10/11 (per
+// MCP verification on build 19045: ssn_resolution_path=4 a.k.a.
+// "ntdll_not_in_kernel_module_list").  ntdll is a USER-mode DLL section-
+// mapped into each process by the section manager, so to read its
+// syscall stub from kernel code we have to attach to a process that
+// has it mapped.
+//
+// This function takes a target PEPROCESS (typically g_test_process,
+// our attached IPC peer) and:
+//   1. KeStackAttachProcess'es into its address space so user VAs in
+//      that process resolve through its CR3.
+//   2. Walks PEB->Ldr->InLoadOrderModuleList looking for "ntdll.dll".
+//   3. Locates NtFreeVirtualMemory via the export table.
+//   4. Reads the syscall stub bytes and extracts the SSN immediate.
+//   5. Detaches.
+//
+// All probe loads are SEH-wrapped because the target process can be
+// torn down between attach and read.  On any fault, returns 0.
+// ============================================================================
+// Minimal local copies of PEB / PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY just
+// large enough to reach the fields we need (Ldr → InLoadOrderModuleList →
+// {InLoadOrderLinks, DllBase, BaseDllName}).  We don't pull in the full
+// phnt definitions to keep this header self-contained and to avoid
+// cascading include order issues with the rest of the driver.
+typedef struct _MIN_PEB_LDR_DATA {
+    ULONG       Length;
+    BOOLEAN     Initialized;
+    PVOID       SsHandle;
+    LIST_ENTRY  InLoadOrderModuleList;
+    LIST_ENTRY  InMemoryOrderModuleList;
+    LIST_ENTRY  InInitializationOrderModuleList;
+} MIN_PEB_LDR_DATA, *PMIN_PEB_LDR_DATA;
+
+typedef struct _MIN_PEB {
+    BYTE              Reserved1[0x18];
+    PMIN_PEB_LDR_DATA Ldr;
+    // remainder intentionally omitted
+} MIN_PEB, *PMIN_PEB;
+
+typedef struct _MIN_LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY     InLoadOrderLinks;
+    LIST_ENTRY     InMemoryOrderLinks;
+    LIST_ENTRY     InInitializationOrderLinks;
+    PVOID          DllBase;
+    PVOID          EntryPoint;
+    ULONG          SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    // remainder intentionally omitted
+} MIN_LDR_DATA_TABLE_ENTRY, *PMIN_LDR_DATA_TABLE_ENTRY;
+
+__forceinline ULONG ResolveSSN_ViaTargetProcess(PEPROCESS userProc) {
+    if (!userProc) {
+        g_NtFreeVirtualMemoryResolutionPath = 11; // no target available
+        return 0;
+    }
+
+    // Resolve PsGetProcessPeb dynamically.  It's an exported routine but
+    // not necessarily called during driver load — same KDU IAT trap as
+    // KeQueryInterruptTime, etc.
+    static PVOID s_PsGetProcessPeb_va = nullptr;
+    if (!s_PsGetProcessPeb_va) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"PsGetProcessPeb");
+        s_PsGetProcessPeb_va = MmGetSystemRoutineAddress(&name);
+    }
+    if (!s_PsGetProcessPeb_va) {
+        g_NtFreeVirtualMemoryResolutionPath = 12; // PsGetProcessPeb unresolved
+        return 0;
+    }
+    typedef PMIN_PEB (NTAPI *fn_PsGetProcessPeb_t)(PEPROCESS);
+    auto pfnGetPeb = (fn_PsGetProcessPeb_t)s_PsGetProcessPeb_va;
+
+    KAPC_STATE apc = {};
+    KeStackAttachProcess(userProc, &apc);
+
+    ULONG ssn_found = 0;
+    ULONG fail_path = 13; // generic failure inside the attach region
+    __try {
+        PMIN_PEB peb = pfnGetPeb(userProc);
+        if (!peb) { fail_path = 14; __leave; }     // no PEB
+
+        PMIN_PEB_LDR_DATA ldr = peb->Ldr;
+        if (!ldr) { fail_path = 15; __leave; }     // no LDR
+
+        // Walk InLoadOrderModuleList for ntdll.dll.
+        PLIST_ENTRY head = &ldr->InLoadOrderModuleList;
+        PLIST_ENTRY cur  = head->Flink;
+        ULONG iters = 0;
+        const ULONG max_iters = 256;
+        PVOID ntdllBase = nullptr;
+
+        while (cur && cur != head && iters++ < max_iters) {
+            auto* entry = CONTAINING_RECORD(cur, MIN_LDR_DATA_TABLE_ENTRY,
+                                            InLoadOrderLinks);
+            // BaseDllName is a UNICODE_STRING — compare against L"ntdll.dll"
+            // exactly.  Some entries may have a Length that includes a
+            // trailing NUL, others won't; the canonical Length of
+            // L"ntdll.dll" without NUL is 9 * sizeof(WCHAR) == 18 bytes.
+            if (entry->BaseDllName.Length == 9 * sizeof(WCHAR) &&
+                entry->BaseDllName.Buffer) {
+                static const WCHAR kNtdll[] = L"ntdll.dll";
+                BOOLEAN match = TRUE;
+                for (USHORT j = 0; j < 9; j++) {
+                    WCHAR a = entry->BaseDllName.Buffer[j];
+                    WCHAR b = kNtdll[j];
+                    if (a >= L'A' && a <= L'Z') a = (WCHAR)(a + 32);
+                    if (b >= L'A' && b <= L'Z') b = (WCHAR)(b + 32);
+                    if (a != b) { match = FALSE; break; }
+                }
+                if (match) {
+                    ntdllBase = entry->DllBase;
+                    break;
+                }
+            }
+            cur = cur->Flink;
+        }
+
+        if (!ntdllBase) { fail_path = 16; __leave; } // ntdll not in PEB Ldr
+
+        // Parse the PE export table to find NtFreeVirtualMemory's stub.
+        auto* pDos = (PIMAGE_DOS_HEADER)ntdllBase;
+        if (pDos->e_magic != IMAGE_DOS_SIGNATURE) { fail_path = 5; __leave; }
+        auto* pNt = (PIMAGE_NT_HEADERS)((PUCHAR)ntdllBase + pDos->e_lfanew);
+        if (pNt->Signature != IMAGE_NT_SIGNATURE) { fail_path = 5; __leave; }
+        auto& expDir = pNt->OptionalHeader
+                            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (!expDir.VirtualAddress || !expDir.Size) { fail_path = 5; __leave; }
+
+        auto* pExport = (PIMAGE_EXPORT_DIRECTORY)((PUCHAR)ntdllBase
+                                                  + expDir.VirtualAddress);
+        auto* names = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfNames);
+        auto* ords  = (PUSHORT)((PUCHAR)ntdllBase + pExport->AddressOfNameOrdinals);
+        auto* funcs = (PULONG)((PUCHAR)ntdllBase + pExport->AddressOfFunctions);
+        const ULONG numNames = pExport->NumberOfNames;
+        const ULONG numFuncs = pExport->NumberOfFunctions;
+
+        BOOLEAN found = FALSE;
+        for (ULONG i = 0; i < numNames; i++) {
+            const char* fnName = (const char*)((PUCHAR)ntdllBase + names[i]);
+            if (strcmp(fnName, "NtFreeVirtualMemory") == 0) {
+                found = TRUE;
+                USHORT fnOrd = ords[i];
+                if (fnOrd >= numFuncs) { fail_path = 7; break; }
+                PUCHAR fnAddr = (PUCHAR)ntdllBase + funcs[fnOrd];
+
+                // ENDBR64 prefix on CET-enabled builds.
+                if (fnAddr[0] == 0xF3 && fnAddr[1] == 0x0F &&
+                    fnAddr[2] == 0x1E && fnAddr[3] == 0xFA) {
+                    fnAddr += 4;
+                }
+
+                // x64 syscall stub: 4C 8B D1 / B8 SSN
+                if (fnAddr[0] == 0x4C && fnAddr[1] == 0x8B &&
+                    fnAddr[2] == 0xD1 && fnAddr[3] == 0xB8) {
+                    ULONG ssn = *(PULONG)(fnAddr + 4);
+                    if (ssn > 0 && ssn < 0x400) {
+                        ssn_found = ssn;
+                    } else {
+                        fail_path = 7;
+                    }
+                } else {
+                    fail_path = 7;
+                }
+                break;
+            }
+        }
+        if (!found && ssn_found == 0) {
+            fail_path = 6; // export missing
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ssn_found = 0;
+        fail_path = 5; // PE/PEB walk faulted
+    }
+    KeUnstackDetachProcess(&apc);
+
+    if (ssn_found) {
+        g_NtFreeVirtualMemoryResolutionPath = 1; // dynamic OK
+        KIPC_LOG("[CR3-IPC] SyscallSpf: NtFreeVirtualMemory SSN=%lu "
+                 "(dynamic via target process)\n", ssn_found);
+    } else {
+        g_NtFreeVirtualMemoryResolutionPath = fail_path;
+    }
+    return ssn_found;
 }
 
 // ============================================================================
@@ -290,7 +581,7 @@ __forceinline PVOID FindRetGadget() {
                 p[2] == kPrimary[2] && p[3] == kPrimary[3] &&
                 p[4] == kPrimary[4]) {
                 g_ret_gadget_ntos = p;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] SyscallSpf: gadget 'add rsp,0x28; ret' at ntos+0x%zX (%p)\n",
                            i, p);
                 return g_ret_gadget_ntos;
@@ -309,7 +600,7 @@ __forceinline PVOID FindRetGadget() {
             if (p[0] == kSecondary[0] && p[1] == kSecondary[1] &&
                 p[2] == kSecondary[2] && p[3] == kSecondary[3] &&
                 p[4] == kSecondary[4]) {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] SyscallSpf: alt gadget 'add rsp,0x20; ret' at ntos+0x%zX (%p) (unused)\n",
                            i, p);
                 break;
@@ -317,7 +608,7 @@ __forceinline PVOID FindRetGadget() {
         }
     }
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] SyscallSpf: FAILED to locate 'add rsp,0x28; ret' gadget in ntoskrnl .text\n");
     return nullptr;
 }
@@ -529,7 +820,7 @@ __forceinline NTSTATUS SpoofedNtFreeVirtualMemory(
     if (!gadget) {
         // No gadget available — fall back to the standard Zw call.
         // This IS detectable but is the safe fallback.
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] SyscallSpf: no ret gadget, falling back to ZwFreeVirtualMemory\n");
         return ZwFreeVirtualMemory(ProcessHandle, BaseAddress, RegionSize, FreeType);
     }

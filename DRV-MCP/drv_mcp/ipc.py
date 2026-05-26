@@ -16,7 +16,10 @@ from __future__ import annotations
 import ctypes
 
 # ─── Constants (mirror shared_memory_ipc.h) ────────────────────────────
-IPC_MAGIC           = 0x504D585F49504332  # 'PMX_IPC2' little-endian
+# Non-printable handshake; bytes 13 AE E2 C8 B5 F2 A1 CD in little-endian
+# memory order have no overlap with the printable ASCII range so user-mode
+# string scanners cannot locate the IPC buffer by grep.
+IPC_MAGIC           = 0xCDA1F2B5C8E2AE13
 IPC_VERSION         = 2
 
 IPC_MAX_SLOTS       = 16

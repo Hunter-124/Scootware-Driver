@@ -32,6 +32,44 @@
 #define HWID_SPOOFER_ENABLED 1
 #endif
 
+// =============================================================================
+// HWID_SPOOFER_PHYS_PATCH_ENABLED — sub-feature gate for physical patches.
+//
+// The SMBIOS-physical-memory and MAC-physical-memory write paths use
+// MmMapIoSpaceEx to map the firmware-published SMBIOS table (or the NDIS
+// adapter's permanent-MAC structure) into the system VA space and overwrite
+// the bytes in place.
+//
+// Reality on Win10/11 — even with the smbios_validate_table_in_ram guard
+// and the content-match cross-check, the physical write can still BSOD on:
+//   * Systems where the SMBIOS lives in `MEMORY_RESERVED` / ACPI-NV ranges
+//     that DO show up in MmGetPhysicalMemoryRanges() but are protected by
+//     SMM / SLAT / TXT and a write trips a machine-check (MCE bugcheck 0x9C
+//     or KMODE_EXCEPTION_NOT_HANDLED 0x1E with second arg 0xC0000005).
+//   * Some Intel ME / AMD PSP firmware revisions mark the BIOS-shadow page
+//     readable but the underlying HW is ROM; the write fault path goes
+//     through the chipset and bugchecks IRQL_NOT_LESS_OR_EQUAL.
+//   * Hyper-V-enlightened kernels where the SMBIOS shadow lives in
+//     a `secure` SLAT region; CR0.WP-style write tricks don't bypass the
+//     EPT VIOLATION raised by the L1 hypervisor.
+//
+// The safe path forward (and what every reputable spoofer actually does):
+//   * Patch the in-memory MSSMBIOS pool copy that Windows constructs at
+//     boot and exposes via NtQuerySystemInformation(SystemFirmwareTable…).
+//     That's regular NonPagedPool — safe to write.
+//   * Write the MachineGuid and NDIS NetworkAddress registry overrides.
+//     These survive reboots and are how AC vendors actually identify
+//     a machine in practice.
+//
+// Until the physical patch can be hardened against the failure modes above,
+// gate it behind this compile-time flag and DEFAULT IT OFF.  ApplySpoof and
+// ApplyCustom continue to do the registry + MSSMBIOS-pool work; only the
+// MmMapIoSpaceEx-into-firmware-page step is skipped.
+// =============================================================================
+#ifndef HWID_SPOOFER_PHYS_PATCH_ENABLED
+#define HWID_SPOOFER_PHYS_PATCH_ENABLED 0
+#endif
+
 #include <ntifs.h>
 #include <ntintsafe.h>
 

@@ -39,8 +39,7 @@ shared-memory IPC buffer. We satisfy the contract from Python by:
 ## Setup
 
 1. Build the kernel driver (`FINAL-DRV/build.bat`) and load `drv.sys`
-   however you normally do — KDU, manual mapping, test-signing service,
-   etc. The MCP doesn't manage driver loading.
+
 2. From this directory, run:
 
    ```cmd

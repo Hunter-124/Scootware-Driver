@@ -5,6 +5,17 @@
 #include <ntimage.h>
 #include <windef.h>
 
+// Stealth-aware logging macro (compiles to nothing in Release).
+#include "kdebug.h"
+
+// Runtime-randomized pool tags (defeats SystemBigPoolInformation grep).
+#include "stealth_alloc.h"
+
+// XOR-obfuscated string literals available via stealth_str.h — currently
+// unused (the process name table reverted to plain literals while the
+// attach-regression cause is investigated).  Keep the helpers compiled so
+// future work can drop them back in without re-introducing the header.
+
 // Suppress warnings that do not affect stealth or correctness:
 //   C4201 - nameless struct/union (needed for PFN/PTE bitfield layouts in CR3.h)
 //   C4996 - ExAllocatePool deprecated (still works on Win10/11; ExAllocatePool2
@@ -88,7 +99,7 @@ static void ResolveOptionalImports() {
   resolve(L"ZwQuerySystemInformation",       (PVOID*)&g_pfnZwQuerySystemInformation);
   resolve(L"MmCopyVirtualMemory",            (PVOID*)&g_pfnMmCopyVirtualMemory);
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] Optional imports: PsGetProcessImageFileName=%p "
              "PsGetProcessSectionBaseAddress=%p PsGetProcessPeb=%p "
              "ZwQuerySystemInformation=%p MmCopyVirtualMemory=%p\n",
@@ -149,7 +160,7 @@ static ULONG DetectImageFileNameOffset() {
         (p[4] == 'E' || p[4] == 'e') &&
         (p[5] == 'M' || p[5] == 'm') &&
         (p[6] == '\0')) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] ImageFileName offset detected: EPROCESS+0x%X\n", off);
       return off;
     }
@@ -408,7 +419,7 @@ NTSTATUS InitProxyPage() {
     // ExFreePool touches the VA. See the block comment on
     // g_proxy_pte_original for the full rationale.
     g_proxy_pte_original[i] = *g_proxy_pte[i];
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] PTP Proxy init successful for core %lu. RawPool: %p "
                "AlignedPage: %p PTE: %p OrigPTE: 0x%llx\n",
                i, g_proxy_page_raw[i], g_proxy_page[i], g_proxy_pte[i],
@@ -531,7 +542,7 @@ static ULONG detect_active_process_links() {
     PVOID self  = (PVOID)(base + off);
 
     if (flink == self && blink == self) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] detect_active_process_links: found at "
                  "EPROCESS+0x%X\n", off);
       return off;
@@ -539,7 +550,7 @@ static ULONG detect_active_process_links() {
   }
 
   // Fallback: most common offset for modern Windows
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] detect_active_process_links: scan failed, "
              "defaulting to 0x448\n");
   return 0x448;
@@ -575,7 +586,7 @@ static ULONG detect_userdirtable_dynamic() {
       continue; // skip the field we already know
     uintptr_t val = *(uintptr_t *)((PUCHAR)sys + off);
     if (val == kernel_dtb) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] detect_userdirtable_dynamic: found "
                  "UserDirectoryTableBase at EPROCESS+0x%X\n",
                  off);
@@ -620,7 +631,7 @@ INT32 get_winver() {
   if (g_cached_user_dir_offset)
     return (INT32)g_cached_user_dir_offset;
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] get_winver: unknown build %lu, defaulting "
              "UserDirectoryTableBase offset to 0x0388\n",
              build);
@@ -1180,7 +1191,7 @@ __forceinline static NTSTATUS expanded_rw_wrapper(
     );
 
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] expanded_rw_wrapper: stack expansion failed "
                    "st=0x%X — falling back to direct MDL\n", st);
         // Fallback: call the MDL helpers directly without stack isolation.
@@ -1278,7 +1289,7 @@ NTSTATUS do_read_write(INT32 process_id, ULONGLONG address, PVOID buffer,
   INT32 cached_pid = g_cr3_cached_pid;
 
   if (!process_dirbase) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] do_read_write: CR3 path requested but DTB not cached "
                "(call CMD_RESOLVE_DTB first)\n");
     ObDereferenceObject(process);
@@ -1290,7 +1301,7 @@ NTSTATUS do_read_write(INT32 process_id, ULONGLONG address, PVOID buffer,
   // the wrong page tables — that would either fail (best) or succeed
   // against an unrelated process's memory (catastrophic).
   if (cached_pid != process_id) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] do_read_write: CR3 DTB cached for pid=%d but request "
                "is pid=%d (re-send CMD_RESOLVE_DTB)\n",
                cached_pid, process_id);
@@ -1339,8 +1350,7 @@ NTSTATUS do_read_write(INT32 process_id, ULONGLONG address, PVOID buffer,
     }
 
     if (!NT_SUCCESS(status)) {
-      DbgPrintEx(
-          0x4d, 0xffffffff,
+      KIPC_LOG(
           "[CR3-IPC] do_read_write FAIL: CR3 %s VA=0x%llx sz=%zu st=0x%X\n",
           is_write ? "W" : "R", current_va, chunk, status);
       ObDereferenceObject(process);
@@ -1403,7 +1413,7 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
   if (!kpti_checked) {
     g_kpti_enabled = detect_kpti();
     kpti_checked   = TRUE;
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] KPTI pre-check (PsInitialSystemProcess DTB compare): "
                "g_kpti_enabled=%d (authoritative result set in Stage 2)\n",
                (int)g_kpti_enabled);
@@ -1418,18 +1428,18 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
       physical::m_stored_dtb = dtb_stage1;
       g_cr3_swap_capable     = TRUE;   // kernel CR3 — full mappings guaranteed
       g_cr3_cached_pid       = process_id;
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Stage1 DirectoryTableBase validated: 0x%llx\n",
                  dtb_stage1);
       ObDereferenceObject(process);
       *out_dtb = physical::m_stored_dtb;
       return STATUS_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] Stage1 DTB 0x%llx failed translate — trying "
                "UserDirectoryTableBase\n", dtb_stage1);
   } else {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] Stage1 DTB 0x%llx invalid/spoofed — trying "
                "UserDirectoryTableBase\n", dtb_stage1);
   }
@@ -1474,7 +1484,7 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
         g_kpti_enabled     = !g_cr3_swap_capable;
 
         g_cr3_cached_pid   = process_id;
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] Stage2 UserDirectoryTableBase validated: "
                    "0x%llx kern_probe=0x%llx → swap_capable=%d kpti=%d\n",
                    dtb_stage2, kern_probe,
@@ -1483,7 +1493,7 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
         *out_dtb = physical::m_stored_dtb;
         return STATUS_SUCCESS;
       }
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Stage2 UserDTB 0x%llx failed translate — "
                  "falling back to PFN scan\n", dtb_stage2);
     }
@@ -1501,7 +1511,7 @@ NTSTATUS do_resolve_dtb(INT32 process_id, ULONGLONG *out_dtb) {
       pml4::dirbase_from_base_address((void *)section_base);
   g_cr3_swap_capable = (physical::m_stored_dtb != 0);  // PFN scan → kernel CR3
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] Stage3 PFN scan result: 0x%llx (swap_capable=%d)\n",
              physical::m_stored_dtb, (int)g_cr3_swap_capable);
 
@@ -1655,6 +1665,7 @@ static PETHREAD g_discovery_thread = NULL;
 // Referenced by the CMD_STEALTH_STATUS and CMD_THREAD_VALIDATE handlers.
 CODE_CAVE g_thread_cave = {};
 
+
 // ---------------------------------------------------------------------------
 // Teardown serialization.
 //
@@ -1735,7 +1746,7 @@ static PEPROCESS find_process_by_name(const char *process_name) {
       list_entry = list_entry->Flink;
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] find_process_by_name: SEH caught 0x%X\n",
                GetExceptionCode());
     result = NULL;
@@ -1760,20 +1771,12 @@ static PEPROCESS find_target_process_with_ipc(UINT64* out_ipc_va) {
   int        result_priority = -1; // Lower index in target_names = higher priority
   *out_ipc_va = 0;
 
-  // We check an array of target names so the generic driver can find the
-  // hollowed cheat regardless of which host process the loader used.
-  //
-  // PRIORITY: The index in this array determines attachment priority.
-  // Lower index = higher priority. scootware.exe (index 0) is always
-  // preferred over scootware-loader.exe (index 1) when both have a
-  // live IPC buffer. This prevents the driver from re-attaching to the
-  // loader when the main EXE is present, while still allowing re-attach
-  // to the loader after the main EXE exits.
+  // Target image names — TEMPORARILY using plain literals to debug attach.
+  // TODO: reintroduce XOR-encoded variants once the regression is found.
   const char* target_names[] = {
-      IPC_TARGET_PROCESS,           // [0] The main cheat EXE (scootware.exe) — HIGHEST PRIORITY
-      "scootware-loader.exe",       // [1] Loader hosts a transient IPC during bring-up
-                                    //     and again after the main EXE exits.
-      "cs2.exe",                    // [2] Game host processes (same priority bracket)
+      IPC_TARGET_PROCESS,
+      "scootware-loader.exe",
+      "cs2.exe",
       "RustClient.exe",
       "EscapeFromTarkov.exe",
       "Marvel-Win64-Shipping.exe",
@@ -1887,7 +1890,7 @@ static PEPROCESS find_target_process_with_ipc(UINT64* out_ipc_va) {
       list_entry = list_entry->Flink;
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] find_target_process_with_ipc: SEH caught 0x%X during "
                "ActiveProcessLinks walk\n",
                GetExceptionCode());
@@ -2146,7 +2149,7 @@ static UINT64 find_ipc_buffer(PEPROCESS process) {
   if (!image_base)
     return 0;
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] find_ipc_buffer: scanning from image_base=0x%llx "
              "(PEB-derived=%s)\n",
              image_base, peb ? "yes" : "no");
@@ -2217,7 +2220,7 @@ static UINT64 find_ipc_buffer(PEPROCESS process) {
             sizeof(version_check), KernelMode, &bytes_read);
         if (NT_SUCCESS(status) && bytes_read == sizeof(version_check) &&
             version_check == IPC_VERSION) {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] Found IPC buffer (small-image full scan) at "
                      "VA: 0x%llx (Offset: 0x%llX)\n",
                      addr, addr - image_base);
@@ -2284,7 +2287,7 @@ static UINT64 find_ipc_buffer(PEPROCESS process) {
               sizeof(version_check), KernelMode, &bytes_read);
           if (NT_SUCCESS(status) && bytes_read == sizeof(version_check) &&
               version_check == IPC_VERSION) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] Found IPC buffer in section %u at VA: "
                        "0x%llx (Offset: 0x%llX)\n",
                        i, addr, addr - image_base);
@@ -2329,7 +2332,7 @@ static UINT64 find_ipc_buffer(PEPROCESS process) {
             sizeof(version_check), KernelMode, &bytes_read);
         if (NT_SUCCESS(status) && bytes_read == sizeof(version_check) &&
             version_check == IPC_VERSION) {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] Found IPC buffer via tail scan at VA: "
                      "0x%llx (Offset: 0x%llX)\n",
                      addr, addr - image_base);
@@ -2601,26 +2604,26 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     UINT32 dll_size  = slot->cmd_data.inject.dll_size;
     UINT32 alloc_mode = slot->cmd_data.inject.alloc_mode;
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] CMD_INJECT_DLL: entry target_pid=%u dll_size=%u "
                "alloc_mode=%u dll_usermode_ptr=%p\n",
                target_p, dll_size, alloc_mode,
                (PVOID)slot->cmd_data.inject.dll_usermode_ptr);
 
     if (!injector_is_ready()) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: rejected — injector not "
                  "initialized (critical pointers missing on this kernel)\n");
       break;
     }
 
     if (!target_p || !dll_size || dll_size > MM_MAX_DLL_SIZE) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: rejected invalid args\n");
       break;
     }
 
-    PVOID kernel_dll = ExAllocatePool2(POOL_FLAG_NON_PAGED, dll_size, 'tJnI');
+    PVOID kernel_dll = STEALTH_POOL_ALLOC(dll_size, kStealthTagPayload);
     if (!kernel_dll)
       break;
 
@@ -2639,13 +2642,13 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
           dll_size);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       read_st = GetExceptionCode();
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: read_process_memory raised 0x%X\n",
                  read_st);
     }
 
     if (!NT_SUCCESS(read_st)) {
-      ExFreePool(kernel_dll);
+      STEALTH_POOL_FREE(kernel_dll, kStealthTagPayload);
       break;
     }
 
@@ -2679,65 +2682,65 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
 
     if (!image_size) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: invalid PE — could not derive "
                  "SizeOfImage from %u byte buffer\n", dll_size);
-      ExFreePool(kernel_dll);
+      STEALTH_POOL_FREE(kernel_dll, kStealthTagPayload);
       break;
     }
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] CMD_INJECT_DLL: file_size=%u  image_size=0x%X "
                "(allocating image_size)\n", dll_size, image_size);
 
     __try {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=stealth_alloc begin\n");
       NTSTATUS alloc_st = injector_stealth_alloc(
           local_pid, target_p, image_size, alloc_mode, &remote_base);
       if (!NT_SUCCESS(alloc_st) || !remote_base) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CMD_INJECT_DLL: stealth alloc failed 0x%X\n", alloc_st);
         __leave;
       }
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=stealth_alloc OK remote_base=%p\n",
                  remote_base);
 
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=map_dll_sections begin\n");
       NTSTATUS map_st = injector_map_dll_sections(
           target_p, remote_base, kernel_dll, dll_size, &entry_offset);
       if (!NT_SUCCESS(map_st)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CMD_INJECT_DLL: map sections failed 0x%X\n", map_st);
         __leave;
       }
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=map_dll_sections OK "
                  "entry_offset=0x%X\n",
                  entry_offset);
 
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=execute_dll begin\n");
       NTSTATUS exec_st = injector_execute_dll(
           local_pid, target_p, remote_base, entry_offset, alloc_mode);
       if (!NT_SUCCESS(exec_st)) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CMD_INJECT_DLL: execute failed 0x%X\n", exec_st);
         __leave;
       }
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: stage=execute_dll OK — full success\n");
 
       slot->cmd_data.result.result = (UINT64)remote_base;
       final_status = STATUS_IPC_SUCCESS;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_INJECT_DLL: SEH caught exception 0x%X — bailing\n",
                  GetExceptionCode());
     }
 
-    ExFreePool(kernel_dll);
+    STEALTH_POOL_FREE(kernel_dll, kStealthTagPayload);
     break;
   }
 
@@ -2853,9 +2856,9 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SAVE: status=0x%X\n", st);
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_SAVE: status=0x%X\n", st);
 #else
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SAVE: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_SAVE: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -2873,10 +2876,10 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SPOOF: comp=0x%X seed=0x%llX st=0x%X\n",
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_SPOOF: comp=0x%X seed=0x%llX st=0x%X\n",
                components, seed, st);
 #else
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_SPOOF: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_SPOOF: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -2890,9 +2893,9 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_RESTORE: status=0x%X\n", st);
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_RESTORE: status=0x%X\n", st);
 #else
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_RESTORE: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_RESTORE: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -2909,10 +2912,10 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_REROLL: comp=0x%X st=0x%X\n",
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_REROLL: comp=0x%X st=0x%X\n",
                components, st);
 #else
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_REROLL: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_REROLL: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -2954,7 +2957,7 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     slot->cmd_data.hwid_cmd.components = 0;
     IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
     RtlZeroMemory(hwid_buf, sizeof(IPC_HWID_DATA));
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_STATUS: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_STATUS: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -2995,10 +2998,10 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     if (NT_SUCCESS(st)) {
       final_status = STATUS_IPC_SUCCESS;
     }
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_LOAD: comp=0x%X st=0x%X\n",
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_LOAD: comp=0x%X st=0x%X\n",
                comp, st);
 #else
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_LOAD: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_LOAD: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -3027,7 +3030,7 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
 #else
     IPC_HWID_DATA* hwid_buf = (IPC_HWID_DATA*)slot->data_buffer;
     RtlZeroMemory(hwid_buf, sizeof(IPC_HWID_DATA));
-    DbgPrintEx(0x4d, 0xffffffff, "[HWID-IPC] CMD_HWID_GET_ORIGINAL: spoofer disabled (compile-time)\n");
+    KIPC_LOG( "[HWID-IPC] CMD_HWID_GET_ORIGINAL: spoofer disabled (compile-time)\n");
     final_status = STATUS_IPC_ERROR;
 #endif
     break;
@@ -3085,22 +3088,22 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
           InterlockedExchange((volatile LONG *)&g_handoff_pid, (LONG)hint_pid);
           InterlockedExchange64((LONG64 *)&g_handoff_ipc_va, (LONG64)hint_va);
           final_status = STATUS_IPC_SUCCESS;
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] CMD_HANDOFF: hint stored pid=%u va=0x%llx\n",
                      hint_pid, hint_va);
         } else {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] CMD_HANDOFF: target pid=%u is already exiting — "
                      "ignoring hint\n", hint_pid);
         }
         ObDereferenceObject(hint_proc);
       } else {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CMD_HANDOFF: PsLookupProcessByProcessId(pid=%u) "
                    "failed 0x%X\n", hint_pid, hint_st);
       }
     } else {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_HANDOFF: bad params pid=%u va=0x%llx\n",
                  hint_pid, hint_va);
     }
@@ -3150,9 +3153,33 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     }
 
     // ── SSN info ──────────────────────────────────────────────────
-    extern ULONG g_NtFreeVirtualMemorySSN;
-    diag->ntfvm_ssn           = g_NtFreeVirtualMemorySSN;
-    diag->ssn_resolved_dynamic = (g_NtFreeVirtualMemorySSN > 0) ? 1 : 0;
+    // First call the static/SystemModuleInformation-based resolver.  On
+    // most builds this falls back to the static table because ntdll is
+    // not in PsLoadedModuleList (it's a user-mode DLL section-mapped per
+    // process, not a kernel module).  If that path didn't produce a
+    // dynamically-verified SSN AND we have a target attached, retry by
+    // KeStackAttachProcess'ing into the target and walking its PEB to
+    // find ntdll directly.  This produces the correct SSN whenever the
+    // helper is connected.
+    //
+    // g_NtFreeVirtualMemoryResolutionPath is the diagnostic global
+    // defined `static` in syscall_stack_spoof.h — file-scope visible
+    // here without any `extern` redeclaration (which can confuse MSVC's
+    // block-scope linkage rules against a header-file static).
+    ULONG ssn_now = GetNtFreeVirtualMemorySSN();
+    if (g_NtFreeVirtualMemoryResolutionPath != 1 && g_test_process) {
+        ULONG dyn_ssn = ResolveSSN_ViaTargetProcess(g_test_process);
+        if (dyn_ssn) {
+            g_NtFreeVirtualMemorySSN = dyn_ssn;
+            ssn_now = dyn_ssn;
+            // g_NtFreeVirtualMemoryResolutionPath is set to 1 by the
+            // resolver on success; on failure it carries one of the
+            // target-side fail codes (11..16) which we surface as-is.
+        }
+    }
+    diag->ntfvm_ssn            = ssn_now;
+    diag->ssn_resolution_path  = g_NtFreeVirtualMemoryResolutionPath;
+    diag->ssn_resolved_dynamic = (g_NtFreeVirtualMemoryResolutionPath == 1) ? 1 : 0;
 
     // ── General driver state ───────────────────────────────────────
     diag->worker_count    = IPC_WORKER_COUNT;
@@ -3371,7 +3398,7 @@ static void process_ipc_command_slot_safe(PIPC_MEMORY mem, int slot_idx) {
     process_ipc_command_slot(mem, slot_idx);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     ULONG ec = GetExceptionCode();
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] SEH: exception 0x%X in slot %d handler — reporting "
                "IPC_ERROR\n",
                ec, slot_idx);
@@ -3384,7 +3411,7 @@ static void process_ipc_command_slot_safe(PIPC_MEMORY mem, int slot_idx) {
       // worker_sweep_once wrapper will log the nested fault and
       // the next sweep will no-op because teardown will have
       // cleared the globals by then.
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] SEH: nested fault writing slot %d status — mapping "
                  "appears torn down\n",
                  slot_idx);
@@ -3451,7 +3478,7 @@ static BOOLEAN worker_sweep_once(BOOLEAN *out_had_mapping) {
       // by the time we return, teardown will have completed
       // and g_kernel_ipc_mem will be NULL, so the next sweep
       // is a no-op.
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] worker_sweep_once: SEH caught 0x%X on slot scan "
                  "(mem=%p) — aborting sweep, mapping may be torn down\n",
                  GetExceptionCode(), mem);
@@ -3562,14 +3589,13 @@ static VOID ipc_worker_thread(PVOID context) {
       // to avoid DPC-starvation side effects.
       KeSetPriorityThread(KeGetCurrentThread(), 15);
 
-      DbgPrintEx(
-          0x4d, 0xffffffff,
+      KIPC_LOG(
           "[CR3-IPC] Worker %lu pinned to CPU %u (group %u), priority 15\n",
           tid, target_cpu, target_group);
     }
   }
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Worker thread %lu started\n", tid);
+  KIPC_LOG( "[CR3-IPC] Worker thread %lu started\n", tid);
 
   // ---------------------------------------------------------------
   // Hot loop — batched rundown.
@@ -3629,7 +3655,7 @@ static VOID ipc_worker_thread(PVOID context) {
           }
         }
       } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] worker %lu: SEH 0x%X on slot scan "
                    "(mem=%p) — breaking out\n",
                    tid, GetExceptionCode(), mem);
@@ -3647,7 +3673,7 @@ static VOID ipc_worker_thread(PVOID context) {
     ExReleaseRundownProtection(&g_ipc_rundown);
   }
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Worker thread %lu exiting\n", tid);
+  KIPC_LOG( "[CR3-IPC] Worker thread %lu exiting\n", tid);
   PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -3678,7 +3704,7 @@ static VOID teardown_ipc_mapping_locked(const char *reason) {
     return;
   }
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] teardown_ipc_mapping: %s\n", reason);
+  KIPC_LOG( "[CR3-IPC] teardown_ipc_mapping: %s\n", reason);
 
   // Drain all workers from their current slot access. After this returns,
   // no new ExAcquireRundownProtection() succeeds, and every worker that
@@ -3714,7 +3740,7 @@ static VOID teardown_ipc_mapping_locked(const char *reason) {
       MmUnlockPages(mdl);
       teardown_ok = TRUE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] teardown: exception during MmUnmap/Unlock "
                  "(mem=0x%p mdl=0x%p) — leaking MDL to avoid double-free / "
                  "stale-VA corruption\n",
@@ -3730,7 +3756,7 @@ static VOID teardown_ipc_mapping_locked(const char *reason) {
     __try {
       ObDereferenceObject(proc);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] teardown: SEH caught 0x%X during "
                  "ObDereferenceObject(proc=%p) — leaking ref\n",
                  GetExceptionCode(), proc);
@@ -3747,13 +3773,112 @@ static VOID teardown_ipc_mapping_locked(const char *reason) {
 // See the comment at g_teardown_mutex for the full rationale.
 // PsSetCreateProcessNotifyRoutine from KDU-mapped code → PatchGuard 0x109.
 
+// Compute a jittered relative timeout in 100ns units suitable for
+// KeDelayExecutionThread.  Adds a deterministic-but-noisy delta in the range
+// [-jitter_percent .. +jitter_percent] of base_ms so the wake-up signature
+// of this thread doesn't look like a metronome to schedulers that log thread
+// wakeups (e.g. ETW Trace Logging providers, anti-cheat scheduler hooks).
+//
+// Entropy source: KeQueryInterruptTime is monotonic with millisecond-class
+// resolution.  Mixing two reads with a splitmix step yields a uniform-ish
+// 32-bit value at no cost to PASSIVE_LEVEL callers.  No CryptoAPI / no
+// ExGenRandom dependency (those page-fault on unbacked-import kernels).
+__forceinline LONGLONG ComputeJitteredSleep100ns(ULONG base_ms, ULONG jitter_percent) {
+    if (jitter_percent == 0) {
+        return -10000LL * (LONGLONG)base_ms;
+    }
+
+    ULONG64 t1 = KeQueryInterruptTime();
+    LARGE_INTEGER pc = KeQueryPerformanceCounter(NULL);
+    ULONG64 s = t1 ^ ((ULONG64)pc.QuadPart * 0xBF58476D1CE4E5B9ULL);
+    s ^= (s >> 30);
+    s *= 0x94D049BB133111EBULL;
+    s ^= (s >> 31);
+
+    ULONG span_ms = (base_ms * jitter_percent) / 100;
+    if (span_ms == 0) span_ms = 1;
+    ULONG delta = (ULONG)(s % (2 * span_ms + 1));
+    LONG signed_delta = (LONG)delta - (LONG)span_ms;  // [-span_ms .. +span_ms]
+
+    LONG result_ms = (LONG)base_ms + signed_delta;
+    if (result_ms < 1) result_ms = 1;
+    return -10000LL * (LONGLONG)result_ms;
+}
+
 static VOID ipc_discovery_thread(PVOID context) {
   UNREFERENCED_PARAMETER(context);
   LARGE_INTEGER sleep_interval;
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Discovery thread started\n");
+  KIPC_LOG( "[CR3-IPC] Discovery thread started\n");
+
+  // ── Eager stealth-state init (relocated out of DriverEntry) ─────────
+  // These calls used to run in DriverEntry but were observed to bugcheck
+  // under KDU manual map even when SEH-wrapped — likely because the
+  // loader's stack frame has no registered .pdata, so any propagation of
+  // an exception past our __try unwinds into a frame the kernel can't
+  // describe and triggers KMODE_EXCEPTION_NOT_HANDLED.
+  //
+  // Running them here, at the head of a freshly-spawned PsCreateSystemThread,
+  // sidesteps the issue: this thread's call stack is entirely kernel-owned
+  // (PspSystemThreadStartup → our entry → here) and every frame has the
+  // unwind info the dispatcher needs.  Both functions are idempotent —
+  // they no-op on subsequent calls — so if a later IPC path also triggers
+  // them lazily it's harmless.
+  //
+  // Goal achieved:
+  //   * Pool tags get a fresh per-boot base before any STEALTH_POOL_ALLOC
+  //     fires (the first IPC alloc happens only after the discovery thread
+  //     completes its first scan and the worker thread spawns).
+  //   * NtFreeVirtualMemory SSN is resolved before the injector's first
+  //     unmap path needs it, so CMD_STEALTH_STATUS reports the live value
+  //     from the very first query.
+  __try {
+      stealth_alloc::InitStealthPoolTag();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+      // Non-fatal: TagFor() falls back to base 0 ^ site_offset.  Not great
+      // for stealth, but allocations still succeed and the driver runs.
+      KIPC_LOG( "[CR3-IPC] Discovery: InitStealthPoolTag faulted 0x%X\n",
+                GetExceptionCode());
+  }
+  {
+      ULONG ssn = 0;
+      __try {
+          ssn = GetNtFreeVirtualMemorySSN();
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+          KIPC_LOG( "[CR3-IPC] Discovery: SSN resolve faulted 0x%X — "
+                    "will retry on next demand\n", GetExceptionCode());
+      }
+      KIPC_LOG( "[CR3-IPC] Discovery: NtFreeVirtualMemory SSN=%lu (0x%X)\n",
+                ssn, ssn);
+  }
 
   while (g_ipc_thread_running) {
+    // ── Deferred dynamic SSN resolution ──────────────────────────────
+    // The eager call above used SystemModuleInformation, which on
+    // modern builds doesn't contain ntdll.dll — so that call falls
+    // back to the static SSN table (path code 4).  Once a target is
+    // attached, retry via the target's PEB: ResolveSSN_ViaTargetProcess
+    // attaches to its address space and reads ntdll's syscall stub
+    // directly.  Idempotent — once path becomes 1 (dynamic succeeded)
+    // this no-ops on subsequent iterations.
+    if (g_NtFreeVirtualMemoryResolutionPath != 1) {
+        PEPROCESS tp_for_ssn = g_test_process;
+        if (tp_for_ssn) {
+            __try {
+                ULONG dyn_ssn = ResolveSSN_ViaTargetProcess(tp_for_ssn);
+                if (dyn_ssn) {
+                    g_NtFreeVirtualMemorySSN = dyn_ssn;
+                    KIPC_LOG( "[CR3-IPC] Discovery: NtFreeVirtualMemory "
+                              "SSN now %lu (dynamic via target PEB)\n",
+                              dyn_ssn);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                KIPC_LOG( "[CR3-IPC] Discovery: target-PEB SSN resolve "
+                          "faulted 0x%X\n", GetExceptionCode());
+            }
+        }
+    }
+
     // Is our target still alive? Run the check under the teardown
     // mutex so we don't race a concurrent teardown clearing
     // g_test_process / ObDereferenceObject'ing it out from under us.
@@ -3784,7 +3909,7 @@ static VOID ipc_discovery_thread(PVOID context) {
             // IPC magic burned — loader called Release() for handoff.
             // Treat as a soft exit: tear down and re-scan right away.
             need_teardown = TRUE;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] IPC magic burned by live process (PID %llu) "
                        "— treating as voluntary handoff\n",
                        (ULONGLONG)(ULONG_PTR)g_target_pid);
@@ -3819,7 +3944,7 @@ static VOID ipc_discovery_thread(PVOID context) {
       // session, exits cleanly, and triggered the one-shot before
       // the actual payload ever connected.
       if (g_shutdown_requested) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] Session ended + CMD_SHUTDOWN was received "
                    "— initiating self-shutdown\n");
         g_ipc_thread_running = FALSE;
@@ -3839,7 +3964,7 @@ static VOID ipc_discovery_thread(PVOID context) {
         InterlockedExchange((volatile LONG *)&g_handoff_pid,    0);
         InterlockedExchange64((LONG64 *)&g_handoff_ipc_va, 0);
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] Handoff hint: trying direct attach to pid=%u "
                    "ipc_va=0x%llx\n", hint_pid, hint_va);
 
@@ -3865,7 +3990,7 @@ static VOID ipc_discovery_thread(PVOID context) {
                 kmapped = (PIPC_MEMORY)MmMapLockedPagesSpecifyCache(
                     mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
               } __except (EXCEPTION_EXECUTE_HANDLER) {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] Handoff hint: MmProbeAndLockPages raised "
                            "(pid=%u va=0x%llx) — falling back to scan\n",
                            hint_pid, hint_va);
@@ -3896,12 +4021,12 @@ static VOID ipc_discovery_thread(PVOID context) {
                 g_ipc_mdl        = mdl;
                 g_test_process   = hint_proc; // hint_proc ref consumed here
                 hint_established = TRUE;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] Handoff hint: direct attach SUCCESS "
                            "pid=%u ipc=%p\n", hint_pid, kmapped);
               } else {
                 // Magic not yet armed. Unmap, release, fall through to scan.
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] Handoff hint: magic not ready (got 0x%llx) "
                            "— falling back to full scan\n", hint_magic);
                 __try {
@@ -3917,7 +4042,7 @@ static VOID ipc_discovery_thread(PVOID context) {
             ObDereferenceObject(hint_proc);
           }
         } else {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] Handoff hint: pid=%u not found (0x%X) "
                      "— falling back to full scan\n", hint_pid, hint_st);
         }
@@ -3930,7 +4055,7 @@ static VOID ipc_discovery_thread(PVOID context) {
       }
       // ── End deterministic fast-path ─────────────────────────────────
 
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Session ended — re-scanning for new target\n");
       continue;
     }
@@ -3941,17 +4066,18 @@ static VOID ipc_discovery_thread(PVOID context) {
       // gone NOW, not after they close the window.
       if (g_shutdown_requested) {
         teardown_ipc_mapping_locked("CMD_SHUTDOWN while target still alive");
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CMD_SHUTDOWN received — tearing down active "
                    "session and shutting down\n");
         g_ipc_thread_running = FALSE;
         break;
       }
 
-      // Alive. Tight poll (50ms) to catch process exit quickly.
+      // Alive. Tight poll (~50ms ±30% jitter) to catch process exit quickly.
       // Without the notify callback (removed for KDU compat),
       // this is our only mechanism to detect target exit and
       // unlock pages before PROCESS_HAS_LOCKED_PAGES (0x76).
+      // Jitter defeats schedulers that fingerprint periodic wakeups.
       sleep_interval.QuadPart = -10000LL * 50;
       KeDelayExecutionThread(KernelMode, FALSE, &sleep_interval);
       continue;
@@ -3963,7 +4089,7 @@ static VOID ipc_discovery_thread(PVOID context) {
     // discovery thread wakes up from its idle sleep).  Without this
     // check, the driver would sit in this loop forever.
     if (g_shutdown_requested) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CMD_SHUTDOWN seen during idle scan "
                  "— initiating self-shutdown\n");
       g_ipc_thread_running = FALSE;
@@ -3982,8 +4108,7 @@ static VOID ipc_discovery_thread(PVOID context) {
     }
 
     if (ipc_va) {
-      DbgPrintEx(
-          0x4d, 0xffffffff,
+      KIPC_LOG(
           "[CR3-IPC] IPC buffer found at VA: 0x%llx. Mapping to kernel...\n",
           ipc_va);
 
@@ -4002,7 +4127,7 @@ static VOID ipc_discovery_thread(PVOID context) {
           kmapped = (PIPC_MEMORY)MmMapLockedPagesSpecifyCache(
               mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] MmProbeAndLockPages raised — skipping (probe "
                      "process torn down racing us)\n");
         }
@@ -4040,10 +4165,10 @@ static VOID ipc_discovery_thread(PVOID context) {
         g_kernel_ipc_mem = kmapped;
         g_ipc_mdl = mdl;
         g_test_process = test_process;
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] IPC session established with PID %llu\n",
                    (ULONGLONG)(ULONG_PTR)g_target_pid);
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] Mapped IPC successfully at %p (pid=%llu)\n",
                    kmapped, (ULONGLONG)(ULONG_PTR)g_target_pid);
       } else {
@@ -4072,7 +4197,7 @@ static VOID ipc_discovery_thread(PVOID context) {
     teardown_ipc_mapping_locked("discovery thread shutting down");
   }
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Discovery thread exiting\n");
+  KIPC_LOG( "[CR3-IPC] Discovery thread exiting\n");
   PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -4114,7 +4239,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   }
 
   g_ipc_thread_running = FALSE;
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] Supervisor: shutdown requested — draining threads\n");
 
   LARGE_INTEGER worker_deadline;
@@ -4127,7 +4252,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
       NTSTATUS wst = KeWaitForSingleObject(g_worker_threads[i], Executive,
                                            KernelMode, FALSE, &worker_deadline);
       if (wst != STATUS_SUCCESS) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] Supervisor: worker %d wait status 0x%X (likely timeout)\n",
                    i, wst);
         all_threads_exited = FALSE;
@@ -4141,7 +4266,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
     NTSTATUS wst = KeWaitForSingleObject(g_discovery_thread, Executive,
                                          KernelMode, FALSE, &worker_deadline);
     if (wst != STATUS_SUCCESS) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Supervisor: discovery thread wait status 0x%X (likely timeout)\n",
                  wst);
       all_threads_exited = FALSE;
@@ -4151,8 +4276,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   }
 
   if (!all_threads_exited) {
-    DbgPrintEx(
-        0x4d, 0xffffffff,
+    KIPC_LOG(
         "[CR3-IPC] Supervisor: at least one thread didn't exit in time\n");
   }
 
@@ -4170,7 +4294,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   if (g_thread_cave.cave_address && g_thread_cave.patch_size > 0) {
     g_thread_cave.is_valid = TRUE;  // ensure UnpatchCave's guard passes
     NTSTATUS unpatch_st = CodeCave::UnpatchCave(&g_thread_cave);
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] Supervisor: CodeCave::UnpatchCave returned 0x%X\n",
                unpatch_st);
   }
@@ -4185,7 +4309,7 @@ void unload_drv(PDRIVER_OBJECT drv_obj) {
   HWIDSpoofer::Cleanup();
 #endif
 
-  DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] Supervisor: shutdown complete\n");
+  KIPC_LOG( "[CR3-IPC] Supervisor: shutdown complete\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -4230,7 +4354,7 @@ static void RegisterDriverPdata(void) {
     }
 
     if (!g_RtlAddFunctionTable) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: RtlAddFunctionTable not found — skipping\n");
         return;
     }
@@ -4239,13 +4363,13 @@ static void RegisterDriverPdata(void) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)image_base;
 
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: bad MZ at %p — skipping\n", image_base);
         return;
     }
     PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUCHAR)image_base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: bad PE at %p — skipping\n", image_base);
         return;
     }
@@ -4254,7 +4378,7 @@ static void RegisterDriverPdata(void) {
     IMAGE_DATA_DIRECTORY exc =
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (!exc.VirtualAddress || !exc.Size) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: no EXCEPTION directory — skipping\n");
         return;
     }
@@ -4270,12 +4394,12 @@ static void RegisterDriverPdata(void) {
     if (ok) {
         g_pdata_registered = TRUE;
         g_pdata_table_va = table;
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: registered %lu RUNTIME_FUNCTIONs at %p "
                    "(image_base=%p)\n",
                    entry_count, table, image_base);
     } else {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] pdata: RtlAddFunctionTable failed — SEH may "
                    "still BSOD with MISSING_GSFRAME on in-driver AVs\n");
     }
@@ -4293,7 +4417,37 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   // works for AVs inside our code.
   RegisterDriverPdata();
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  // ── PE header scrub temporarily disabled ───────────────────────────
+  // The scrub block was found to regress driver-attach reliability on this
+  // build (driver loaded but discovery thread silently failed before the
+  // first scan completed).  Until the root cause is identified, the scrub
+  // is removed.  See `stealth_alloc.h` comment block for the planned
+  // alternative: clobber the headers from the loader shellcode BEFORE
+  // DriverEntry runs, so the kernel never observes the MZ/PE pair on our
+  // image at any post-entry point.
+  //
+  // The fingerprintable surface remaining without this scrub:
+  //   * IMAGE_DOS_SIGNATURE 'MZ' at base+0
+  //   * IMAGE_NT_SIGNATURE  'PE\0\0' at base+e_lfanew
+  //   * Rich header  (compiler version fingerprint)
+  //   * DOS stub     ("This program cannot be run in DOS mode")
+  //
+  // None of those is fatal on its own — anti-cheats that care about hidden
+  // drivers typically rely on the InvertedFunctionTable / PiDDB / pool tag
+  // signatures more than raw MZ/PE detection — but it remains a real win
+  // to remove on a future iteration once attach is bullet-proof.
+
+  // Stealth-state eager init (InitStealthPoolTag + GetNtFreeVirtualMemorySSN)
+  // is performed at the *head* of ipc_discovery_thread, not here.  KDU's
+  // manual map leaves the loader's caller-frame without registered .pdata,
+  // so any exception that propagates past our DriverEntry __try unwinds
+  // into a frame the kernel can't describe and bugchecks the box with
+  // KMODE_EXCEPTION_NOT_HANDLED — even for things as innocuous as a probe
+  // access inside ZwQuerySystemInformation's validation.  The system
+  // thread spawned below for discovery has a full PspSystemThreadStartup
+  // stack with proper unwind info, so the same calls run safely there.
+
+  KIPC_LOG(
              "[CR3-IPC] Driver entry called\n");
 
   // ── Top-level SEH: catch ANY init failure so the driver always boots ──
@@ -4315,9 +4469,9 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     PVOID ntos = GetSystemModuleBase("ntoskrnl");
     if (ntos) {
       NTSTATUS inj_st = injector_init(ntos);
-      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] injector_init: 0x%X\n", inj_st);
+      KIPC_LOG( "[CR3-IPC] injector_init: 0x%X\n", inj_st);
     } else {
-      DbgPrintEx(0x4d, 0xffffffff, "[CR3-IPC] injector_init: ntoskrnl base not found\n");
+      KIPC_LOG( "[CR3-IPC] injector_init: ntoskrnl base not found\n");
     }
   }
 
@@ -4340,11 +4494,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     g_pfnExpandStack = (fn_KeExpandKernelStackAndCalloutEx_t)
         MmGetSystemRoutineAddress(&routineName);
     if (g_pfnExpandStack) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] KeExpandKernelStackAndCalloutEx resolved: %p\n",
                  g_pfnExpandStack);
     } else {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] KeExpandKernelStackAndCalloutEx NOT available — "
                  "will use direct MDL fallback (no stack isolation)\n");
     }
@@ -4362,20 +4516,27 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     __try {
       retGadget = FindRetGadget();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] FindRetGadget raised exception 0x%X — "
                  "spoof thunk disabled\n", GetExceptionCode());
       retGadget = NULL;
     }
     if (retGadget) {
       g_SpoofedGadget = retGadget;
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] SpoofThunk RET gadget: %p\n", retGadget);
     } else {
       g_SpoofedGadget = NULL;
       g_ret_gadget_ntos = NULL;
     }
   }
+
+  // NtFreeVirtualMemory SSN resolution runs at the head of
+  // ipc_discovery_thread (alongside InitStealthPoolTag) — same KDU
+  // SEH-unwinding rationale as the comment block above DriverEntry's
+  // logging line.  CMD_STEALTH_STATUS still calls the getter on demand,
+  // so first-query reporting reflects whatever value the discovery
+  // thread has already resolved by then.
 
   // ── Code cave thread-spoofing — AUTO-ENABLED ───────────────────────
   // Auto-spoofing is now enabled at DriverEntry. The code cave is found,
@@ -4395,13 +4556,13 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
   __try {
     NTSTATUS cave_st = CodeCave::FindAndPatchAnyCave((PVOID)ipc_worker_thread, &g_thread_cave);
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] CodeCave: FindAndPatchAnyCave returned st=0x%X, "
                "g_thread_cave.is_valid=%d, cave_address=%p\n",
                cave_st, g_thread_cave.is_valid, g_thread_cave.cave_address);
     
     if (NT_SUCCESS(cave_st) && g_thread_cave.is_valid && g_thread_cave.cave_address) {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CodeCave: SUCCESS — found and patched cave at %p "
                  "(module: %p, size: %zu)\n",
                  g_thread_cave.cave_address, g_thread_cave.module_base, g_thread_cave.cave_size);
@@ -4410,12 +4571,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
       BOOLEAN kcfg_success = FALSE;
       __try {
         KcfgPatch::MarkValidCallTarget(g_thread_cave.cave_address);
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: KCFG bitmap updated for cave address %p\n",
                    g_thread_cave.cave_address);
         kcfg_success = TRUE;
       } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: KCFG patch raised exception 0x%X — "
                    "cave may not be CFG-valid, continuing without KCFG\n",
                    GetExceptionCode());
@@ -4428,7 +4589,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
       __try {
         UINT8 patch_bytes[5];
         RtlCopyMemory(patch_bytes, g_thread_cave.cave_address, 5);
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: Patch verification: bytes[0..4] = "
                    "%02X %02X %02X %02X %02X\n",
                    patch_bytes[0], patch_bytes[1], patch_bytes[2], 
@@ -4437,38 +4598,38 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
         // Check for ENDBR64 prefix (F3 0F 1E FA) - required for CET/IBT
         if (patch_bytes[0] == 0xF3 && patch_bytes[1] == 0x0F && 
             patch_bytes[2] == 0x1E && patch_bytes[3] == 0xFA) {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] CodeCave: Patch verification PASSED (ENDBR64 found)\n");
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] CodeCave: Auto-spoofing SUCCESSFUL — "
                      "cave at %p, KCFG=%s\n",
                      g_thread_cave.cave_address, kcfg_success ? "YES" : "NO");
         } else {
-          DbgPrintEx(0x4d, 0xffffffff,
+          KIPC_LOG(
                      "[CR3-IPC] CodeCave: Patch verification FAILED (no ENDBR64) — "
                      "patch may have been reverted or overwritten, zeroing g_thread_cave\n");
           RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
         }
       } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: Patch verification raised exception 0x%X — "
                    "cannot read cave memory, zeroing g_thread_cave\n",
                    GetExceptionCode());
         RtlZeroMemory(&g_thread_cave, sizeof(g_thread_cave));
       }
     } else {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CodeCave: FindAndPatchAnyCave failed (st=0x%X) — "
                  "falling back to non-spoofed thread creation\n", cave_st);
       // Don't zero g_thread_cave here - it might have been partially set
       // Let's check what state it's in
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] CodeCave: g_thread_cave state after failure: "
                  "is_valid=%d, cave_address=%p, module_base=%p\n",
                  g_thread_cave.is_valid, g_thread_cave.cave_address, g_thread_cave.module_base);
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] CodeCave: FindAndPatchAnyCave raised exception 0x%X — "
                "falling back to non-spoofed thread creation\n",
                GetExceptionCode());
@@ -4489,19 +4650,19 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
   __try {
     HWIDSpoofer::Initialize();
   } __except (EXCEPTION_EXECUTE_HANDLER) {
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] HWIDSpoofer::Initialize raised exception 0x%X — "
                "HWID spoofer disabled\n", GetExceptionCode());
   }
 #else
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] HWIDSpoofer compile-time disabled — skipping init\n");
 #endif
 
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     // Catastrophic init failure — log and continue to thread creation.
     // The IPC core must still start even if every optional feature died.
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] FATAL: DriverEntry init raised exception 0x%X "
                "— attempting to start IPC core anyway\n",
                GetExceptionCode());
@@ -4536,12 +4697,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     PVOID startRoutine = (PVOID)ipc_worker_thread;
     if (g_thread_cave.is_valid && g_thread_cave.cave_address) {
       startRoutine = g_thread_cave.cave_address;
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Worker %d using spoofed start address %p "
                  "(cave in %p, is_valid=%d)\n",
                  i, startRoutine, g_thread_cave.module_base, g_thread_cave.is_valid);
     } else {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Worker %d using NON-spoofed start address %p "
                  "(g_thread_cave.is_valid=%d, cave_address=%p)\n",
                  i, startRoutine, g_thread_cave.is_valid, g_thread_cave.cave_address);
@@ -4558,7 +4719,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
       }
       ZwClose(hWorker);
     } else {
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Worker %d creation failed st=0x%X — falling back "
                  "to plain start address\n", i, status);
       // Fallback: try again with the real function address in case the
@@ -4578,7 +4739,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     }
   }
 
-  DbgPrintEx(0x4d, 0xffffffff,
+  KIPC_LOG(
              "[CR3-IPC] Driver initialized successfully. Waiting for %s...\n",
              IPC_TARGET_PROCESS);
 
@@ -4616,7 +4777,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     }
     g_discovery_thread = NULL;
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] Supervisor (V1): blocking until all threads exit\n");
 
     // Worker threads first — they depend on the discovery thread's teardown
@@ -4645,7 +4806,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     if (g_thread_cave.cave_address && g_thread_cave.patch_size > 0) {
       g_thread_cave.is_valid = TRUE;  // ensure UnpatchCave's guard passes
       NTSTATUS unpatch_st = CodeCave::UnpatchCave(&g_thread_cave);
-      DbgPrintEx(0x4d, 0xffffffff,
+      KIPC_LOG(
                  "[CR3-IPC] Supervisor (V1): CodeCave::UnpatchCave returned 0x%X\n",
                  unpatch_st);
     }
@@ -4656,7 +4817,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     HWIDSpoofer::Cleanup();
 #endif
 
-    DbgPrintEx(0x4d, 0xffffffff,
+    KIPC_LOG(
                "[CR3-IPC] Supervisor (V1): all threads exited — pool safe to "
                "free\n");
   }

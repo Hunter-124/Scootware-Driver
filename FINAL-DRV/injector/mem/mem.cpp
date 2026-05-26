@@ -4,6 +4,7 @@
 #include "page_table.hpp"
 #include "validation.hpp"
 #include "../utils/raii.hpp"
+#include "../../kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 namespace mem {
 
   /**
@@ -810,14 +811,14 @@ namespace mem {
     const size_t aligned_size = (size + page_mask) & ~page_mask;
     const size_t page_count = aligned_size >> PAGE_SHIFT;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] allocate_between_modules: enter pid=%u size=0x%llx\n",
                target_pid, (unsigned long long)aligned_size);
 
     PEPROCESS target_process = nullptr;
     if (globals::ps_lookup_process_by_process_id(reinterpret_cast<HANDLE>(target_pid),
                                                  &target_process) != STATUS_SUCCESS) {
-      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+      KIPC_LOG(
                  "[INJECTOR] allocate_between_modules: ps_lookup failed\n");
       return nullptr;
     }
@@ -826,14 +827,14 @@ namespace mem {
 
     const auto target_dir_base = physical::get_process_directory_base(target_process);
     if (!target_dir_base) {
-      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+      KIPC_LOG(
                  "[INJECTOR] allocate_between_modules: dir_base = 0\n");
       return nullptr;
     }
 
     PPEB peb_address = globals::ps_get_process_peb(target_process);
     if (!peb_address) {
-      DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+      KIPC_LOG(
                  "[INJECTOR] allocate_between_modules: PsGetProcessPeb returned NULL\n");
       return nullptr;
     }
@@ -846,7 +847,7 @@ namespace mem {
     NTSTATUS rst = physical::read_process_memory(
         target_process, reinterpret_cast<uintptr_t>(peb_address),
         &peb, sizeof(PEB));
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] allocate_between_modules: read PEB at %p st=0x%X "
                "Ldr=%p\n",
                peb_address, rst, peb.Ldr);
@@ -856,7 +857,7 @@ namespace mem {
     rst = physical::read_process_memory(
         target_process, reinterpret_cast<uintptr_t>(peb.Ldr),
         &ldr_data, sizeof(PEB_LDR_DATA));
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] allocate_between_modules: read LDR at %p st=0x%X "
                "InMemFlink=%p\n",
                peb.Ldr, rst, ldr_data.InMemoryOrderModuleList.Flink);
@@ -874,13 +875,13 @@ namespace mem {
 
     do {
       if (--max_iters <= 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] allocate_between_modules: iteration cap hit, "
                    "bailing — Flink chain appears corrupt\n");
         return nullptr;
       }
       if (!current_entry) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] allocate_between_modules: current_entry NULL\n");
         return nullptr;
       }
@@ -890,7 +891,7 @@ namespace mem {
       NTSTATUS est = physical::read_process_memory(
           target_process, entry_va, &entry, sizeof(LDR_DATA_TABLE_ENTRY));
       if (!NT_SUCCESS(est)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] allocate_between_modules: read LDR_ENTRY at "
                    "%p failed st=0x%X — bailing\n",
                    (PVOID)entry_va, est);

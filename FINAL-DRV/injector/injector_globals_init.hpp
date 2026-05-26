@@ -4,6 +4,7 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <ntimage.h>
+#include "../kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
 // Injector type definitions and globals namespace
 #include "def/globals.hpp"
@@ -300,7 +301,7 @@ static bool inj_accept_nt_create_thread_ex(UINT8* hit, SIZE_T remaining, void* c
     int* candidate_count = (int*)ctx;
     if (candidate_count) ++*candidate_count;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] NtCreateThreadEx candidate at %p — validating...\n",
                (PVOID)hit);
 
@@ -324,13 +325,13 @@ static bool inj_accept_nt_create_thread_ex(UINT8* hit, SIZE_T remaining, void* c
     if (off == (SIZE_T)-1) off = match_at(gs_read_rdx, sizeof(gs_read_rdx));
 
     if (off != (SIZE_T)-1) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] candidate at %p ACCEPTED (gs[188h] at +0x%llx)\n",
                    (PVOID)hit, (unsigned long long)off);
         return true;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] candidate at %p REJECTED (no gs[188h] in first "
                "0x%llx bytes)\n",
                (PVOID)hit, (unsigned long long)scan_len);
@@ -391,7 +392,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     if (globals::initialized) return STATUS_SUCCESS;
 
     if (!ntos_base_addr) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] injector_init_globals: NULL ntos_base_addr\n");
         return STATUS_INVALID_PARAMETER;
     }
@@ -409,7 +410,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
 #define INJ_RESOLVE(field, wname, ftype)                                             \
     globals::field = (ftype)inj_resolve(wname);                                      \
     if (!globals::field)                                                              \
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                        \
+        KIPC_LOG(                        \
                    "[INJECTOR] WARNING: " #wname " not found\n");
 
     // Mm — memory management exports
@@ -448,7 +449,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
             globals::mm_user_probe_address =
                 (function_types::mm_user_probe_address_t)(uintptr_t)*p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] WARNING: MmUserProbeAddress not found\n");
     }
 
@@ -635,7 +636,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 "11-push /GS+arg-save pattern (.text)";
         } else {
             // Fall back to scanning every IMAGE_SCN_CNT_CODE section.
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] NtCreateThreadEx: .text section scan "
                        "missed — trying every code section\n");
             hit = inj_scan_pattern(ntos_base_addr, nt_ctx_pattern);
@@ -648,7 +649,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         }
 
         if (!globals::nt_create_thread_ex) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] NtCreateThreadEx: BOTH section-restricted "
                        "and all-CODE scans missed — printing PE section "
                        "layout for diagnosis\n");
@@ -662,7 +663,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                     for (USHORT si = 0; si < nt2->FileHeader.NumberOfSections; ++si) {
                         char name_buf[9] = {};
                         for (int n = 0; n < 8; ++n) name_buf[n] = secs2[si].Name[n];
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                        KIPC_LOG(
                                    "[INJECTOR]   section[%u] name='%s' VA=+0x%X "
                                    "size=0x%X chars=0x%X\n",
                                    (unsigned)si, name_buf,
@@ -676,12 +677,12 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     }
 
     if (globals::nt_create_thread_ex) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] nt_create_thread_ex = %p (resolved via %s)\n",
                    (PVOID)globals::nt_create_thread_ex,
                    nt_create_thread_ex_source);
     } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] WARNING: NtCreateThreadEx unresolved (export "
                    "lookups via MmGetSystemRoutineAddress and manual walk, "
                    "plus prologue pattern, all failed) — inject path will "
@@ -719,7 +720,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         globals::zw_resume_thread = (function_types::zw_resume_thread_t)
             inj_get_export(ntos_base_addr, "NtResumeThread");
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] zw_resume_thread = %p\n",
                (PVOID)globals::zw_resume_thread);
 
@@ -756,7 +757,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
 #define INJ_SCAN(field, pattern_str, ftype, sym_name)                        \
     globals::field = (ftype)inj_scan_pattern(ntos_base_addr, pattern_str);   \
     if (!globals::field)                                                       \
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                 \
+        KIPC_LOG(                 \
                    "[INJECTOR] WARNING: pattern scan failed for " sym_name "\n");
 
 // Like INJ_SCAN but tries pat2 before warning.  pat1 = Win10 22H2 (19045),
@@ -766,7 +767,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     if (!globals::field)                                                         \
         globals::field = (ftype)inj_scan_pattern(ntos_base_addr, pat2);         \
     if (!globals::field)                                                          \
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,                            \
+        KIPC_LOG(                            \
                    "[INJECTOR] WARNING: pattern scan failed for " sym_name "\n");
 
     INJ_SCAN(ke_flush_single_tb,
@@ -828,7 +829,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 (function_types::mm_allocate_independent_pages_ex_t)
                     inj_resolve_rel(call_site, 1, 5);
             if (globals::mm_allocate_independent_pages_ex) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                KIPC_LOG(
                            "[INJECTOR] MmAllocateIndependentPagesEx: exports "
                            "absent, resolved via KeAllocateInterrupt call-site "
                            "= %p\n",
@@ -837,7 +838,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         }
     }
     if (!globals::mm_allocate_independent_pages_ex) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] WARNING: MmAllocateIndependentPagesEx "
                    "unresolved (export + KeAllocateInterrupt call-site both "
                    "failed) — falling back to MmAllocateContiguousMemory\n");
@@ -879,7 +880,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 (function_types::mm_free_independent_pages)
                     inj_resolve_rel(call_site, 1, 5);
             if (globals::mm_free_independent_pages) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                KIPC_LOG(
                            "[INJECTOR] MmFreeIndependentPages: export absent, "
                            "resolved via call-site = %p\n",
                            (PVOID)globals::mm_free_independent_pages);
@@ -887,7 +888,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         }
     }
     if (!globals::mm_free_independent_pages) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] WARNING: MmFreeIndependentPages unresolved — "
                    "matching free path will fall through to "
                    "MmFreeContiguousMemory\n");
@@ -921,7 +922,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                 "48 C1 E9 12 48 B8 ? ? ? ? ? ? ? ? 48 23 C8 48 B8");
     }
     if (!globals::mi_get_pde_address)
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] WARNING: MiGetPdeAddress not found (export + pattern)\n");
 
     INJ_SCAN(mi_reserve_ptes,
@@ -1013,7 +1014,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         if (p)
             globals::psp_exit_thread = (uintptr_t)p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] WARNING: PspExitThread pattern not found\n");
     }
 
@@ -1060,7 +1061,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                     if (candidate >= 0xFFFFE00000000000ULL &&
                         candidate <  0xFFFFF00000000000ULL) {
                         globals::mm_pfn_db = (uintptr_t)target;
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                        KIPC_LOG(
                                    "[INJECTOR] MmPfnDatabase: resolved via "
                                    "MmGetVirtualForPhysical body scan = %p "
                                    "(value=%p)\n",
@@ -1072,7 +1073,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         }
     }
     if (!globals::mm_pfn_db)
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] WARNING: MmPfnDatabase not found\n");
 
     // ps_loaded_module_list: MmGetSystemRoutineAddress returns the address of
@@ -1082,7 +1083,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         if (p)
             globals::ps_loaded_module_list = (uintptr_t)p;
         else
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] WARNING: PsLoadedModuleList not found\n");
     }
 
@@ -1092,7 +1093,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         osvi.dwOSVersionInfoSize = sizeof(osvi);
         globals::rtl_get_version(&osvi);
         globals::build_version = osvi.dwBuildNumber;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] build_version = %lu\n", globals::build_version);
     }
 
@@ -1126,7 +1127,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
             }
         }
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] physical page range: pfn 0x%llx - 0x%llx\n",
                    (unsigned long long)globals::mm_lowest_physical_page,
                    (unsigned long long)globals::mm_highest_physical_page);
@@ -1163,7 +1164,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     {
         NTSTATUS phys_st = physical::init();
         if (!NT_SUCCESS(phys_st))
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] WARNING: physical::init() failed: 0x%08X"
                        " — contiguous-window alloc unavailable\n", phys_st);
         // Do NOT return failure here; standard alloc modes remain operational.
@@ -1178,7 +1179,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
     // transparently falls back to MmAllocateContiguousMemory in that case.
     // The remaining two are non-negotiable for any inject codepath.
     if (!globals::mi_get_pte_address || !globals::nt_create_thread_ex) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+        KIPC_LOG(
                    "[INJECTOR] FATAL: critical pointers missing —"
                    " mi_get_pte_address=%p  nt_create_thread_ex=%p"
                    "  (mm_allocate_independent_pages_ex=%p — NULL is OK,"
@@ -1190,7 +1191,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
         return STATUS_UNSUCCESSFUL;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] critical pointers:"
                " mm_allocate_independent_pages_ex=%p"
                "  mm_free_independent_pages=%p"
@@ -1201,7 +1202,7 @@ inline NTSTATUS injector_init_globals(PVOID ntos_base_addr) {
                (PVOID)(uintptr_t)globals::mm_allocate_contiguous_memory,
                (PVOID)(uintptr_t)globals::mm_free_contiguous_memory);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+    KIPC_LOG(
                "[INJECTOR] injector_init_globals: OK"
                " (build=%lu  pfn_db=0x%llx)\n",
                globals::build_version,

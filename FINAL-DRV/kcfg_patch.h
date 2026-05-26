@@ -67,6 +67,7 @@
 #include <ntifs.h>
 #include <ntimage.h>
 #include <intrin.h>
+#include "kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
 // Forward declaration — defined in driver.cpp; brings in the system module
 // base by case-insensitive name match.
@@ -237,19 +238,19 @@ namespace KcfgPatch {
         // builds.  GuardCFCheckFunctionPointer (offset 0x70) holds the VA of
         // the function pointer that the CFG thunk calls through.
         PVOID fptrLoc = FindGuardCFCheckFPtrViaLoadConfig(ntosBase);
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] KcfgPatch: LoadConfig lookup → fptrLoc=%p\n", fptrLoc);
 
         // Fallback: export table — older builds or unusual link configs.
         if (!fptrLoc) {
             fptrLoc = FindExport(ntosBase, "_guard_check_icall_fptr");
             if (!fptrLoc) fptrLoc = FindExport(ntosBase, "__guard_check_icall_fptr");
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: export fallback → fptrLoc=%p\n", fptrLoc);
         }
 
         if (!fptrLoc || !MmIsAddressValid(fptrLoc)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: _guard_check_icall_fptr not found "
                        "— KCFG inactive on this build\n");
             info.valid = TRUE;
@@ -260,7 +261,7 @@ namespace KcfgPatch {
         info.fptr_value = *(PVOID*)fptrLoc;
 
         if (!info.fptr_value || !MmIsAddressValid(info.fptr_value)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: fptr_value=%p invalid — KCFG inactive\n",
                        info.fptr_value);
             info.valid = TRUE;
@@ -293,7 +294,7 @@ namespace KcfgPatch {
             info.nop_func = info.fptr_value;
             info.kcfg_active = FALSE;
             info.valid = TRUE;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: fptr prologue is NOP — KCFG inactive\n");
             g_cfg_cached = info; g_cfg_resolved = TRUE; return info;
         }
@@ -304,7 +305,7 @@ namespace KcfgPatch {
         if (info.nop_func && info.fptr_value == info.nop_func) {
             info.kcfg_active = FALSE;
             info.valid = TRUE;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: fptr == _nop export — KCFG inactive\n");
             g_cfg_cached = info; g_cfg_resolved = TRUE; return info;
         }
@@ -314,7 +315,7 @@ namespace KcfgPatch {
 
         info.bitmap_base_loc = DecodeBitmapBaseRef((PUCHAR)info.fptr_value);
         if (!info.bitmap_base_loc) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: could not pattern-decode KiCfgBitMapBase "
                        "from _guard_dispatch_icall at %p\n", info.fptr_value);
             g_cfg_cached = info; g_cfg_resolved = TRUE; return info;
@@ -322,7 +323,7 @@ namespace KcfgPatch {
 
         info.bitmap_base = *(PUCHAR*)info.bitmap_base_loc;
         if (!info.bitmap_base) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: KiCfgBitMapBase is NULL — dispatch "
                        "function will pass all targets; CFG effectively off\n");
             info.kcfg_active = FALSE;
@@ -331,7 +332,7 @@ namespace KcfgPatch {
         }
 
         info.valid = TRUE;
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] KcfgPatch: resolved — fptr_loc=%p fptr_val=%p nop=%p "
                    "bitmap_base_loc=%p bitmap=%p active=%u\n",
                    info.fptr_loc, info.fptr_value, info.nop_func,
@@ -394,7 +395,7 @@ namespace KcfgPatch {
             PVOID exp = FindExport(ntosBase, kProbes[i]);
             if (!exp) continue;
             int bit = ReadBit(bitmapBase, (ULONG_PTR)exp);
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: layout probe %s @ %p → bit=%d\n",
                        kProbes[i], exp, bit);
             if (bit == 1) return TRUE;
@@ -420,7 +421,7 @@ namespace KcfgPatch {
         if (!address) return STATUS_INVALID_PARAMETER;
 
         if (((ULONG_PTR)address & 0xF) != 0) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: %p not 16-byte aligned — CFG will "
                        "fast-fail before bitmap check; refusing to set bit\n", address);
             return STATUS_INVALID_PARAMETER;
@@ -429,7 +430,7 @@ namespace KcfgPatch {
         // HVCI gate.  Writing to .data is permitted by CR0.WP toggle only when
         // SLAT isn't enforcing it from above the kernel.
         if (IsHvciActive()) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: HVCI active — skipping bitmap write "
                        "(would EPT-fault)\n");
             return STATUS_NOT_SUPPORTED;
@@ -438,7 +439,7 @@ namespace KcfgPatch {
         CFG_RESOLVE info = Resolve();
         if (!info.valid) return STATUS_NOT_FOUND;
         if (!info.kcfg_active) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: KCFG inactive — no bit flip needed for %p\n",
                        address);
             return STATUS_SUCCESS;
@@ -449,7 +450,7 @@ namespace KcfgPatch {
         // our shift/granularity assumption is wrong on this build.  Bail
         // before we set a bit somewhere arbitrary.
         if (!ValidateLayout(info.bitmap_base)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: layout validation failed — bitmap "
                        "shift/granularity differs on this build; aborting\n");
             return STATUS_NOT_SUPPORTED;
@@ -462,7 +463,7 @@ namespace KcfgPatch {
         PUCHAR byteAddr = info.bitmap_base + byteOffset;
 
         if (!MmIsAddressValid(byteAddr)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: bitmap byte %p not accessible for addr %p\n",
                        byteAddr, address);
             return STATUS_ACCESS_VIOLATION;
@@ -470,7 +471,7 @@ namespace KcfgPatch {
 
         UCHAR mask = (UCHAR)(1u << bitInByte);
         if (*byteAddr & mask) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: bit already set for %p (byte %p, bit %u)\n",
                        address, byteAddr, bitInByte);
             return STATUS_SUCCESS;
@@ -486,7 +487,7 @@ namespace KcfgPatch {
             InterlockedOr8((CHAR*)byteAddr, (CHAR)mask);
             bitSet = TRUE;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] KcfgPatch: direct write faulted (0x%X) — "
                        "trying MmMapIoSpace\n", GetExceptionCode());
         }
@@ -527,7 +528,7 @@ namespace KcfgPatch {
         }
         KeMemoryBarrier();
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] KcfgPatch: marked %p as CFG-valid (byte %p bit %u → %02X)\n",
                    address, byteAddr, bitInByte, (unsigned)*byteAddr);
         return STATUS_SUCCESS;

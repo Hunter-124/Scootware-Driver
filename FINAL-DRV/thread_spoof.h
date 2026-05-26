@@ -51,6 +51,7 @@
 #include <ntifs.h>
 #include <ntimage.h>
 #include <intrin.h>  // __cpuid for CodeCave_SerializeAllCpus
+#include "kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
 // Forward declaration: physical::write_physical is defined in CR3.h (included
 // before this header in driver.cpp). The namespace is brought in scope via
@@ -255,14 +256,14 @@ namespace CodeCave {
                 *TextStart = (PUCHAR)ModuleBase + pSec[i].VirtualAddress;
                 *TextSize  = pSec[i].Misc.VirtualSize;
                 
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] GetTextSectionRange: found executable section '%.8s' at %p (size=%zu)\n",
                            pSec[i].Name, *TextStart, *TextSize);
                 return STATUS_SUCCESS;
             }
         }
         
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] GetTextSectionRange: no executable .text section found in module %p\n",
                    ModuleBase);
         return STATUS_NOT_FOUND;
@@ -369,24 +370,23 @@ namespace CodeCave {
         _In_ PUCHAR Start,
         _In_ SIZE_T Length,
         _In_ SIZE_T MinCaveSize,
-        _In_ BOOLEAN IsLargeModule,  // TRUE for ntoskrnl, FALSE for smaller modules
+        _In_ BOOLEAN IsLargeModule,  // Kept for signature compatibility; internally ignored
         _Out_ PUCHAR *OutCaveStart)
     {
         *OutCaveStart = nullptr;
-        if (Length < (MinCaveSize + 1)) return 0; // need RET + at least N bytes
+        UNREFERENCED_PARAMETER(MinCaveSize);
+        UNREFERENCED_PARAMETER(IsLargeModule);
 
-        // Use different minimums based on module size
-        // Large modules (ntoskrnl) need space for abs64 jumps
-        // Small modules can work with rel32 jumps
-        const SIZE_T runMin = IsLargeModule ? CAVE_RUN_MIN_NTOSKRNL : CAVE_RUN_MIN_SMALL_MODULE;
-        
-        DbgPrintEx(0x4d, 0xffffffff,
-                   "[CR3-IPC] FindCaveInRange: scanning %zu bytes, runMin=%zu, IsLargeModule=%d\n",
-                   Length, runMin, IsLargeModule);
-        
-        if (Length < (runMin + 1)) return 0;
+        // We always require:
+        // - 16-byte alignment for CFG (Control Flow Guard) compatibility (all target modules use /guard:cf)
+        // - CAVE_PATCH_ABS64 (18 bytes) usable space for absolute jump support (since manual-mapped driver displacement is > 2GB)
+        const SIZE_T alignRequirement = 16;
+        const SIZE_T requiredSize = CAVE_PATCH_ABS64; // 18 bytes
 
-        for (SIZE_T i = 0; i <= Length - (runMin + 1); i++) {
+        // Minimum run size before alignment is at least the requiredSize (18)
+        if (Length < (requiredSize + 1)) return 0;
+
+        for (SIZE_T i = 0; i <= Length - (requiredSize + 1); i++) {
             if (Start[i] != 0xC3) continue;
 
             // Count the 0xCC run immediately after the RET.
@@ -394,7 +394,7 @@ namespace CodeCave {
             for (SIZE_T j = i + 1; j < Length && Start[j] == 0xCC; j++) {
                 cc_count++;
             }
-            if (cc_count < runMin) {
+            if (cc_count < requiredSize) {
                 // Run too short — skip past it and resume scanning.
                 i += cc_count;
                 continue;
@@ -403,11 +403,7 @@ namespace CodeCave {
             PUCHAR runStart  = &Start[i + 1];
             PUCHAR runEnd    = runStart + cc_count;
 
-            // For large modules (ntoskrnl), we need 16-byte alignment for CFG
-            // For smaller modules, we can be more flexible
-            ULONG_PTR alignRequirement = IsLargeModule ? 16 : 8;
-            
-            // Advance runStart to the next aligned position.
+            // Advance runStart to the next 16-byte aligned position.
             ULONG_PTR runStartVA  = (ULONG_PTR)runStart;
             ULONG_PTR alignOffset = (alignRequirement - (runStartVA & (alignRequirement - 1))) & (alignRequirement - 1);
             PUCHAR    alignedStart = runStart + alignOffset;
@@ -420,15 +416,14 @@ namespace CodeCave {
             
             SIZE_T usable = (SIZE_T)(runEnd - alignedStart);
             
-            // Check if we have enough space for the appropriate patch type
-            SIZE_T requiredSize = IsLargeModule ? CAVE_PATCH_ABS64 : CAVE_PATCH_REL32;
-            if (usable < (SIZE_T)requiredSize) {
+            // Check if we have enough space for the absolute patch (18 bytes)
+            if (usable < requiredSize) {
                 i += cc_count;
                 continue;
             }
             
-            DbgPrintEx(0x4d, 0xffffffff,
-                       "[CR3-IPC] FindCaveInRange: found potential cave: run %p+%zu, aligned %p, usable %zu, required %zu\n",
+            KIPC_LOG(
+                       "[CR3-IPC] FindCaveInRange: found safe CFG-compliant cave: run %p+%zu, aligned %p, usable %zu, required %zu\n",
                        runStart, cc_count, alignedStart, usable, requiredSize);
 
             *OutCaveStart = alignedStart;
@@ -498,7 +493,7 @@ namespace CodeCave {
                 }
                 if (match) {
                     modBase = m.ImageBase;
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                                "[CR3-IPC] FindCodeCave: found module %s at %p (path: %s)\n",
                                ModuleName, modBase, path);
                     break;
@@ -525,7 +520,7 @@ namespace CodeCave {
             
             if (substringMatch) {
                 modBase = m.ImageBase;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] FindCodeCave: found module %s (substring match) at %p (path: %s)\n",
                            ModuleName, modBase, path);
                 break;
@@ -533,7 +528,7 @@ namespace CodeCave {
             
             // Debug: print all modules if we're looking for specific ones
             if (strstr(ModuleName, "hal") || strstr(ModuleName, "CI") || strstr(ModuleName, "fltmgr")) {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] FindCodeCave: module[%lu]: %s at %p (size: %lu)\n",
                            i, path, m.ImageBase, m.ImageSize);
             }
@@ -541,7 +536,7 @@ namespace CodeCave {
         ExFreePool(pMods);
 
         if (!modBase) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] FindCodeCave: module %s not found in system module list\n",
                        ModuleName);
             return STATUS_NOT_FOUND;
@@ -556,65 +551,20 @@ namespace CodeCave {
         // Determine if this is a large module (ntoskrnl) or small module
         BOOLEAN isLargeModule = (strstr(ModuleName, "ntoskrnl") != nullptr);
         
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] FindCodeCave: scanning %s, text section %p+%zu, isLargeModule=%d\n",
                    ModuleName, textStart, textSize, isLargeModule);
         
-        // Scan .text for a cave - try with appropriate settings first
+        // Scan .text for a cave - unified and robust 16-aligned scan
         PUCHAR caveStart = nullptr;
         SIZE_T caveSize = FindCaveInRange(
             (PUCHAR)textStart, textSize, CAVE_MIN_SIZE, isLargeModule, &caveStart);
 
-        // If no cave found with standard settings, try more relaxed settings for small modules
         if (!caveSize || !caveStart) {
-            if (!isLargeModule) {
-                DbgPrintEx(0x4d, 0xffffffff,
-                           "[CR3-IPC] FindCodeCave: no cave found with standard settings, trying relaxed scan for %s\n",
-                           ModuleName);
-                
-                // Try with even smaller requirements
-                // For very small modules, we might need to accept smaller caves
-                const SIZE_T relaxedRunMin = 12;  // Enough for ENDBR64 + rel32 with some alignment slack
-                
-                // Simple scan without strict alignment requirements
-                for (SIZE_T i = 0; i <= textSize - (relaxedRunMin + 1); i++) {
-                    PUCHAR current = (PUCHAR)textStart + i;
-                    
-                    // Look for RET (0xC3) followed by enough 0xCC bytes
-                    if (*current != 0xC3) continue;
-                    
-                    SIZE_T cc_count = 0;
-                    for (SIZE_T j = 1; j < textSize - i && ((PUCHAR)textStart)[i + j] == 0xCC; j++) {
-                        cc_count++;
-                    }
-                    
-                    if (cc_count >= CAVE_PATCH_REL32) {
-                        // Found a suitable cave
-                        caveStart = (PUCHAR)textStart + i + 1;
-                        caveSize = cc_count;
-                        
-                        // Try to align to at least 8 bytes if possible
-                        ULONG_PTR caveVa = (ULONG_PTR)caveStart;
-                        ULONG_PTR alignOffset = (8 - (caveVa & 7)) & 7;
-                        if (alignOffset < caveSize) {
-                            caveStart += alignOffset;
-                            caveSize -= alignOffset;
-                        }
-                        
-                        DbgPrintEx(0x4d, 0xffffffff,
-                                   "[CR3-IPC] FindCodeCave: found relaxed cave in %s at %p (size=%zu)\n",
-                                   ModuleName, caveStart, caveSize);
-                        break;
-                    }
-                }
-            }
-            
-            if (!caveSize || !caveStart) {
-                DbgPrintEx(0x4d, 0xffffffff,
-                           "[CR3-IPC] FindCodeCave: no suitable cave found in %s (text size=%zu)\n",
-                           ModuleName, textSize);
-                return STATUS_NOT_FOUND;
-            }
+            KIPC_LOG(
+                       "[CR3-IPC] FindCodeCave: no suitable CFG-compliant cave found in %s (text size=%zu)\n",
+                       ModuleName, textSize);
+            return STATUS_NOT_FOUND;
         }
 
         OutCave->module_base  = modBase;
@@ -622,7 +572,7 @@ namespace CodeCave {
         OutCave->cave_size    = caveSize;
         OutCave->is_valid     = TRUE;
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: found in %s at %p (size=%zu, .text=%p+%zx)\n",
                    ModuleName, caveStart, caveSize, textStart, textSize);
         return STATUS_SUCCESS;
@@ -666,7 +616,7 @@ namespace CodeCave {
         // which is not catchable by SEH and bugchecks the system.  Detect and
         // bail cleanly so the caller's __try/__except path can fall back.
         if (IsHvciActive()) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: HVCI/KMCI active — skipping patch "
                        "(would EPT-fault)\n");
             return STATUS_NOT_SUPPORTED;
@@ -677,7 +627,7 @@ namespace CodeCave {
         // during the HIGH_LEVEL write section is not catchable by SEH and
         // produces an immediate BSOD — validating here keeps us at PASSIVE.
         if (!MmIsAddressValid(Cave->cave_address)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: cave %p not accessible — aborting\n",
                        Cave->cave_address);
             return STATUS_ACCESS_VIOLATION;
@@ -693,7 +643,7 @@ namespace CodeCave {
             const PUCHAR probe = (PUCHAR)Cave->cave_address;
             for (SIZE_T k = 0; k < checkLen; k++) {
                 if (probe[k] != 0xCC) {
-                    DbgPrintEx(0x4d, 0xffffffff,
+                    KIPC_LOG(
                                "[CR3-IPC] CodeCave: byte[%zu] at %p = 0x%02X "
                                "(not 0xCC) — may be live code, aborting\n",
                                k, Cave->cave_address, (unsigned)probe[k]);
@@ -734,7 +684,7 @@ namespace CodeCave {
             patch[7] = (UINT8)((disp >> 16) & 0xFF);
             patch[8] = (UINT8)((disp >> 24) & 0xFF);
             patchSize = CAVE_PATCH_REL32;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: ENDBR+rel32 patch %p -> %p (disp=0x%X)\n",
                        Cave->cave_address, TargetFunction, disp);
         } else if (Cave->cave_size >= CAVE_PATCH_ABS64) {
@@ -746,14 +696,14 @@ namespace CodeCave {
                 patch[10 + i] = (UINT8)((tgtVa >> (i * 8)) & 0xFF);
             }
             patchSize = CAVE_PATCH_ABS64;
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: ENDBR+abs64 patch %p -> %p\n",
                        Cave->cave_address, TargetFunction);
         } else {
             // Target unreachable via rel32 and cave too small for abs64.
             // The OLD code would have happily truncated disp64 to INT32 here,
             // producing a JMP into hyperspace.  Refuse instead.
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: unreachable — disp=0x%llX, cave=%zu, "
                        "need %d for abs64\n",
                        (unsigned long long)disp64, Cave->cave_size,
@@ -783,11 +733,11 @@ namespace CodeCave {
                 RtlCopyMemory(writeDst, patch, patchSize);
                 MmUnmapIoSpace(mapped, PAGE_SIZE);
                 writeOk = TRUE;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] CodeCave: wrote %zu bytes via MmMapIoSpace "
                            "(PA=%llX)\n", patchSize, cavePa.QuadPart);
             } else {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] CodeCave: MmMapIoSpace failed for PA=%llX "
                            "— falling back to CR0.WP\n", cavePa.QuadPart);
             }
@@ -845,7 +795,7 @@ namespace CodeCave {
         // own thread (e.g., a dedicated system thread spawned for the
         // purpose) — never from DriverEntry's calling context.
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: patch applied (%zu bytes) at %p, "
                    "target=%p (relying on IRETQ-induced dispatch serialize)\n",
                    patchSize, Cave->cave_address, TargetFunction);
@@ -878,13 +828,13 @@ namespace CodeCave {
             return STATUS_INVALID_PARAMETER;
 
         if (IsHvciActive()) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: HVCI active — skipping unpatch\n");
             return STATUS_NOT_SUPPORTED;
         }
 
         if (!MmIsAddressValid(Cave->cave_address)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: cave %p not accessible for unpatch\n",
                        Cave->cave_address);
             return STATUS_ACCESS_VIOLATION;
@@ -908,7 +858,7 @@ namespace CodeCave {
                 RtlCopyMemory(writeDst, restore, Cave->patch_size);
                 MmUnmapIoSpace(mapped, PAGE_SIZE);
                 writeOk = TRUE;
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] CodeCave: unpatched %u bytes via MmMapIoSpace "
                            "(PA=%llX)\n", Cave->patch_size, cavePa.QuadPart);
             }
@@ -935,7 +885,7 @@ namespace CodeCave {
         __invlpg(Cave->cave_address);
         KeMemoryBarrier();
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CodeCave: unpatch complete — %u bytes at %p restored to 0xCC\n",
                    Cave->patch_size, Cave->cave_address);
 
@@ -969,6 +919,7 @@ namespace CodeCave {
         static const char* g_priority_modules[] = {
             "ntoskrnl.exe",
             "hal.dll",
+            "halmacpi.dll",
             "CI.dll",
             "fltmgr.sys"
         };
@@ -978,7 +929,7 @@ namespace CodeCave {
             CODE_CAVE cave = {};
             NTSTATUS st = FindCodeCave(g_priority_modules[i], &cave);
             if (!NT_SUCCESS(st)) {
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] CodeCave: no cave in %s (st=0x%X)\n",
                            g_priority_modules[i], st);
                 continue;
@@ -992,12 +943,12 @@ namespace CodeCave {
                 int ni = 0;
                 while (src[ni] && ni < 63) { OutCave->module_name[ni] = src[ni]; ni++; }
                 OutCave->module_name[ni] = '\0';
-                DbgPrintEx(0x4d, 0xffffffff,
+                KIPC_LOG(
                            "[CR3-IPC] CodeCave: SUCCESS — using %s cave at %p\n",
                            g_priority_modules[i], cave.cave_address);
                 return STATUS_SUCCESS;
             }
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CodeCave: patch failed for %s (st=0x%X)\n",
                        g_priority_modules[i], st);
         }
@@ -1033,7 +984,7 @@ namespace CodeCave {
         CODE_CAVE cave = {};
         NTSTATUS st = FindAndPatchAnyCave(RealStartRoutine, &cave);
         if (!NT_SUCCESS(st)) {
-            DbgPrintEx(0x4d, 0xffffffff,
+            KIPC_LOG(
                        "[CR3-IPC] CreateSpoofedSystemThread: no cave available, "
                        "falling back to raw PsCreateSystemThread\n");
             // Fallback: spawn the thread with its real start address.
@@ -1061,7 +1012,7 @@ namespace CodeCave {
                                   (PKSTART_ROUTINE)cave.cave_address,
                                   StartContext);
 
-        DbgPrintEx(0x4d, 0xffffffff,
+        KIPC_LOG(
                    "[CR3-IPC] CreateSpoofedSystemThread: thread=%p "
                    "cave=%p real=%p st=0x%X\n",
                    ThreadHandle ? *ThreadHandle : NULL,

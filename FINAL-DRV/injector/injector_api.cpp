@@ -11,6 +11,8 @@
 #include "mem/mem.hpp"
 #include "mem/phys.hpp"
 #include "utils/raii.hpp"
+#include "../kdebug.h"        // KIPC_LOG — compiles to no-op in Release
+#include "../stealth_alloc.h" // STEALTH_POOL_ALLOC — randomized tags
 
 // ─────────────────────────────────────────────────────────────────────────────
 // pml4::g_mmonp_MmPfnDatabase definition
@@ -197,11 +199,11 @@ static PVOID inj_find_export_in_target(PEPROCESS target_proc,
     SIZE_T funcs_sz = exp_dir.NumberOfFunctions * sizeof(ULONG);
 
     auto* name_rvas = static_cast<ULONG*>(
-        ExAllocatePool2(POOL_FLAG_NON_PAGED, names_sz, 'INRv'));
+        STEALTH_POOL_ALLOC(names_sz, kStealthTagIatN));
     auto* ordinals  = static_cast<USHORT*>(
-        ExAllocatePool2(POOL_FLAG_NON_PAGED, ords_sz,  'IORd'));
+        STEALTH_POOL_ALLOC(ords_sz,  kStealthTagIatO));
     auto* func_rvas = static_cast<ULONG*>(
-        ExAllocatePool2(POOL_FLAG_NON_PAGED, funcs_sz, 'IFRv'));
+        STEALTH_POOL_ALLOC(funcs_sz, kStealthTagIatF));
 
     PVOID result = nullptr;
 
@@ -259,9 +261,14 @@ static PVOID inj_find_export_in_target(PEPROCESS target_proc,
     }
 
 out:
-    if (name_rvas) ExFreePoolWithTag(name_rvas, 'INRv');
-    if (ordinals)  ExFreePoolWithTag(ordinals,  'IORd');
-    if (func_rvas) ExFreePoolWithTag(func_rvas, 'IFRv');
+    // Frees MUST match the allocator's tag.  These buffers come from
+    // STEALTH_POOL_ALLOC, which derives a per-boot randomized tag from
+    // stealth_alloc::TagFor(site); using the old hardcoded 'INRv'/'IORd'/'IFRv'
+    // tags here would bugcheck BAD_POOL_HEADER under Driver Verifier and
+    // pollute !poolused attribution on production kernels.
+    if (name_rvas) STEALTH_POOL_FREE(name_rvas, kStealthTagIatN);
+    if (ordinals)  STEALTH_POOL_FREE(ordinals,  kStealthTagIatO);
+    if (func_rvas) STEALTH_POOL_FREE(func_rvas, kStealthTagIatF);
     return result;
 }
 
@@ -296,7 +303,7 @@ NTSTATUS injector_stealth_alloc(UINT32  local_pid,
             // lock the relevant page-table page before modifying entries —
             // refuse if it didn't resolve.
             if (!globals::mi_lock_page_table_page) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                KIPC_LOG(
                            "[INJECTOR] injector_stealth_alloc: rejecting "
                            "INJ_ALLOC_INSIDE_MAIN_MODULE (mode 0) — "
                            "mi_lock_page_table_page unresolved; pattern scan "
@@ -365,7 +372,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
     // conversion internally.  Do the same here: copy SizeOfHeaders + each
     // section into a SizeOfImage-sized buffer at their VirtualAddress.  From
     // that point on, `local_dll_buf` is in memory form and RVAs Just Work.
-    PVOID local_dll_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, image_size, 'jMpI');
+    PVOID local_dll_buf = STEALTH_POOL_ALLOC(image_size, kStealthTagPayload);
     if (!local_dll_buf) return STATUS_INSUFFICIENT_RESOURCES;
 
     {
@@ -452,7 +459,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                 ? 0
                 : import_dir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
 
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] imports: scanning up to %llu descriptors\n",
                        (unsigned long long)desc_max);
 
@@ -473,7 +480,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                 // arbitrary kernel pool memory — the page fault we saw
                 // happened inside DbgPrintEx's internal string copy.
                 if (cur->Name == 0 || cur->Name >= dll_size) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                    KIPC_LOG(
                                "[INJECTOR] map_sections: import desc %llu has "
                                "out-of-bounds Name RVA 0x%X (dll_size=0x%X) — "
                                "skipping\n",
@@ -491,7 +498,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                 SIZE_T name_len = 0;
                 while (name_len < name_max && dll_name[name_len] != '\0') ++name_len;
                 if (name_len == name_max) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                    KIPC_LOG(
                                "[INJECTOR] map_sections: import desc %llu name "
                                "not null-terminated within buffer — skipping\n",
                                (unsigned long long)desc_i);
@@ -502,7 +509,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                 if (!mod_base) {
                     // dll_name is now known to be a safe null-terminated
                     // string inside local_dll_buf — printing with %s is OK.
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                    KIPC_LOG(
                                "[INJECTOR] imports: %s NOT FOUND in target — "
                                "calls into this DLL will null-deref (target "
                                "must already have this dependency loaded; "
@@ -513,7 +520,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                     ++unresolved_modules;
                     continue;
                 }
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                KIPC_LOG(
                            "[INJECTOR] imports: %s -> %p (resolving functions)\n",
                            dll_name, mod_base);
                 ++resolved_modules;
@@ -619,14 +626,14 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
             }
             globals::obf_dereference_object(target_proc);
 
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] imports: tally — modules %lu resolved / "
                        "%lu unresolved, functions %lu resolved / %lu "
                        "unresolved\n",
                        resolved_modules, unresolved_modules,
                        resolved_functions, unresolved_functions);
             if (unresolved_modules || unresolved_functions) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+                KIPC_LOG(
                            "[INJECTOR] imports: WARNING — DllMain will "
                            "very likely crash the target when it invokes "
                            "an unresolved import.  Inject a DLL whose "
@@ -634,7 +641,7 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                            "or arrange to LoadLibrary them first.\n");
             }
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] injector_map_dll_sections: could not open"
                        " target pid %u for import resolution\n", target_pid);
         }
@@ -650,10 +657,11 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
                                              local_dll_buf,
                                              nt->OptionalHeader.SizeOfHeaders);
         if (!NT_SUCCESS(st)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] injector_map_dll_sections: header write"
                        " failed: 0x%08X\n", st);
-            ExFreePoolWithTag(local_dll_buf, 'jMpI');
+            // Match the STEALTH_POOL_ALLOC tag for this buffer (kStealthTagPayload).
+            STEALTH_POOL_FREE(local_dll_buf, kStealthTagPayload);
             return st;
         }
     }
@@ -678,13 +686,14 @@ NTSTATUS injector_map_dll_sections(UINT32  target_pid,
 
         NTSTATUS st = inj_write_process_phys(target_pid, dst, src, write_size);
         if (!NT_SUCCESS(st))
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, 0xFFFFFFFF,
+            KIPC_LOG(
                        "[INJECTOR] injector_map_dll_sections: section %hu"
                        " write failed: 0x%08X\n", i, st);
     }
 
     *out_entry_offset = nt->OptionalHeader.AddressOfEntryPoint;
-    ExFreePoolWithTag(local_dll_buf, 'jMpI');
+    // Match the STEALTH_POOL_ALLOC tag for this buffer (kStealthTagPayload).
+    STEALTH_POOL_FREE(local_dll_buf, kStealthTagPayload);
     return STATUS_SUCCESS;
 }
 

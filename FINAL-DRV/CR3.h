@@ -546,7 +546,16 @@ namespace pml4
 		// starting offset within each range is unpredictable across boots.
 		// This breaks the flat sequential access pattern that produces a
 		// detectable "spike" in physical-memory reads at driver load time.
-		UINT64 rng = (UINT64)(ULONG_PTR)KeQueryInterruptTime();
+		//
+		// We use __rdtsc() instead of KeQueryInterruptTime() because
+		// KDU's manual mapper has been observed to leave the IAT entries
+		// for "rarely-called" imports unresolved.  KeQueryInterruptTime
+		// is only used in this DTB resolver and the HWID spoofer — both
+		// IPC-triggered, never during load — so its IAT slot still
+		// points at the file-time name-hint RVA in some KDU configs and
+		// the first call bugchecks with an execute-AV.  __rdtsc() is a
+		// CPU instruction with no IAT dependency; equally good entropy.
+		UINT64 rng = (UINT64)__rdtsc();
 		rng ^= (UINT64)(ULONG_PTR)PsInitialSystemProcess;
 		auto rng_next = [&]() -> UINT64 {
 			rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
