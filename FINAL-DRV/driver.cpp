@@ -9,7 +9,7 @@
 #include "kdebug.h"
 
 // Runtime-randomized pool tags (defeats SystemBigPoolInformation grep).
-#include "stealth_alloc.h"
+#include "private_pool.h"
 
 // XOR-obfuscated string literals available via stealth_str.h — currently
 // unused (the process name table reverted to plain literals while the
@@ -40,10 +40,10 @@
 #include "shared_memory_ipc.h"
 
 // HWID Spoofer
-#include "hwid_spoofer.hpp"
+#include "device_profile.hpp"
 
 // PT-injector API (C-linkage isolation layer)
-#include "injector/injector_api.hpp"
+#include "loader/loader_api.hpp"
 
 #ifndef MM_MAX_DLL_SIZE
 #define MM_MAX_DLL_SIZE (32 * 1024 * 1024)
@@ -664,9 +664,9 @@ typedef struct _RTL_PROCESS_MODULES {
 
 // Stealth modules — included after SystemModuleInformation and PRTL_PROCESS_MODULES
 // are defined so the code-cave scanner and syscall resolver can use them.
-#include "thread_spoof.h"
-#include "syscall_stack_spoof.h"
-#include "kcfg_patch.h"  // depends on IsHvciActive from thread_spoof.h
+#include "thread_ctx.h"
+#include "syscall_stack_ctx.h"
+#include "kcfg_patch.h"  // depends on IsHvciActive from thread_ctx.h
 
 bool kernel_strstr(const char *str, const char *sub) {
   if (!str || !sub)
@@ -995,7 +995,22 @@ static NTSTATUS rw_via_cr3_swap(UINT64 target_cr3, UINT64 va,
     // the bottom bits of PteAddress. The PTE itself always starts on an 8-byte
     // boundary, so clearing bits [3:0] is always safe.
     pte_va = (const MMPTE*)((ULONG_PTR)pte_va & ~0xFULL);
-    if (!pte_va || !(pte_va->u.Long & 1 /* Valid */)) {
+
+    // ── Canonical-address guard ────────────────────────────────────────
+    // A corrupted or partially-swizzled PFN entry can produce a PteAddress
+    // whose high bits are NOT 0xFFFF (i.e. a non-canonical address).
+    // Dereferencing a non-canonical pointer at DISPATCH_LEVEL raises a
+    // General Protection Fault (#GP) which has no SEH handler at this IRQL
+    // and immediately escalates to KMODE_EXCEPTION_NOT_HANDLED (0x1E).
+    // Reject anything that is not a proper kernel-space canonical address
+    // (bits [63:48] must all be 1) before attempting any dereference.
+    ULONG_PTR pva_int = (ULONG_PTR)pte_va;
+    if (!pte_va || (pva_int >> 48) != 0xFFFFULL) {
+      __writecr3(old_cr3);
+      KeLowerIrql(old_irql);
+      return STATUS_ACCESS_VIOLATION;
+    }
+    if (!(pte_va->u.Long & 1 /* Valid */)) {
       __writecr3(old_cr3);
       KeLowerIrql(old_irql);
       return STATUS_ACCESS_VIOLATION;
@@ -1009,10 +1024,22 @@ static NTSTATUS rw_via_cr3_swap(UINT64 target_cr3, UINT64 va,
   // and already encodes the byte offset within the page.  Do NOT add
   // offset_in_page again — doing so would advance the pointer by (va & 0xFFF)
   // extra bytes and corrupt every non-page-aligned access.
-  if (is_write) {
-    RtlCopyMemory((PUCHAR)(ULONG_PTR)va, buffer, chunk);
-  } else {
-    RtlCopyMemory(buffer, (PUCHAR)(ULONG_PTR)va, chunk);
+  //
+  // __try/__except catches the residual trimmer-race window: if the page is
+  // evicted in the ~5 instructions between Phase 5 and the memcpy, the
+  // resulting fault is converted to STATUS_ACCESS_VIOLATION rather than
+  // crashing the system. The SEH tables (.pdata) are in non-paged memory so
+  // unwinding is safe under the target's kernel CR3.
+  __try {
+    if (is_write) {
+      RtlCopyMemory((PUCHAR)(ULONG_PTR)va, buffer, chunk);
+    } else {
+      RtlCopyMemory(buffer, (PUCHAR)(ULONG_PTR)va, chunk);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    __writecr3(old_cr3);
+    KeLowerIrql(old_irql);
+    return STATUS_ACCESS_VIOLATION;
   }
 
   // ── Phase 7: restore ──────────────────────────────────────────────────
@@ -2943,6 +2970,8 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
       memcpy(hwid_buf->machine_guid,            current_hwid.machine_guid, HWID_MAX_GUID_LEN);
       memcpy(hwid_buf->volume_serial,           current_hwid.volume_serial, HWID_MAX_VOLUME_LEN);
       memcpy(hwid_buf->mac_address,             current_hwid.mac_address, HWID_MAX_MAC_LEN);
+      hwid_buf->mac_adapter_subkey = current_hwid.mac_adapter_subkey;
+      memcpy(hwid_buf->disk_serial,             current_hwid.disk_serial, HWID_MAX_DISK_SERIAL_LEN);
       hwid_buf->timestamp          = current_hwid.timestamp;
       hwid_buf->components_present = current_hwid.components_present;
     }
@@ -2978,6 +3007,8 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
     memcpy(loaded_hwid.machine_guid,            hwid_buf->machine_guid, HWID_MAX_GUID_LEN);
     memcpy(loaded_hwid.volume_serial,           hwid_buf->volume_serial, HWID_MAX_VOLUME_LEN);
     memcpy(loaded_hwid.mac_address,             hwid_buf->mac_address, HWID_MAX_MAC_LEN);
+    loaded_hwid.mac_adapter_subkey = hwid_buf->mac_adapter_subkey;
+    memcpy(loaded_hwid.disk_serial,             hwid_buf->disk_serial, HWID_MAX_DISK_SERIAL_LEN);
     loaded_hwid.timestamp          = hwid_buf->timestamp;
     loaded_hwid.components_present = hwid_buf->components_present;
 
@@ -3022,6 +3053,8 @@ static void process_ipc_command_slot(PIPC_MEMORY mem, int slot_idx) {
       memcpy(hwid_buf->machine_guid,            orig_hwid.machine_guid, HWID_MAX_GUID_LEN);
       memcpy(hwid_buf->volume_serial,           orig_hwid.volume_serial, HWID_MAX_VOLUME_LEN);
       memcpy(hwid_buf->mac_address,             orig_hwid.mac_address, HWID_MAX_MAC_LEN);
+      hwid_buf->mac_adapter_subkey = orig_hwid.mac_adapter_subkey;
+      memcpy(hwid_buf->disk_serial,             orig_hwid.disk_serial, HWID_MAX_DISK_SERIAL_LEN);
       hwid_buf->timestamp          = orig_hwid.timestamp;
       hwid_buf->components_present = orig_hwid.components_present;
     }

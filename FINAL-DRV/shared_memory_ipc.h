@@ -156,6 +156,7 @@ typedef struct _IPC_HANDOFF_DATA {
 #define HWID_MAX_GUID_LEN      40
 #define HWID_MAX_MAC_LEN       18
 #define HWID_MAX_VOLUME_LEN    128
+#define HWID_MAX_DISK_SERIAL_LEN 64
 
 // HWID component bitmask flags (mirrored from hwid_spoofer.hpp)
 #define HWID_COMP_SMBIOS_UUID        (1 << 0)
@@ -163,6 +164,7 @@ typedef struct _IPC_HANDOFF_DATA {
 #define HWID_COMP_REGISTRY_GUID      (1 << 2)
 #define HWID_COMP_VOLUME_SERIAL      (1 << 3)
 #define HWID_COMP_MAC_ADDRESS        (1 << 4)
+#define HWID_COMP_DISK_SERIAL        (1 << 5)
 #define HWID_COMP_ALL                0xFFFFFFFF
 
 typedef struct _IPC_HWID_DATA {
@@ -174,6 +176,8 @@ typedef struct _IPC_HWID_DATA {
     CHAR    machine_guid[HWID_MAX_GUID_LEN];
     CHAR    volume_serial[HWID_MAX_VOLUME_LEN];
     CHAR    mac_address[HWID_MAX_MAC_LEN];
+    UINT32  mac_adapter_subkey;
+    CHAR    disk_serial[HWID_MAX_DISK_SERIAL_LEN];
     UINT64  timestamp;
     UINT32  components_present;
     UINT32  reserved;

@@ -8,7 +8,7 @@
 
 #pragma warning(disable: 4996)  // ExAllocatePoolWithTag deprecated — still safe on Win10/11
 #pragma warning(disable: 4505)  // unreferenced helpers kept for reference
-#include "hwid_spoofer.hpp"
+#include "device_profile.hpp"
 #include <stddef.h> // For offsetof
 #include "kdebug.h"  // KIPC_LOG — compiles to no-op in Release
 
@@ -41,11 +41,56 @@ extern "C" {
         ULONG SystemInformationLength, PULONG ReturnLength);
 }
 
-// ZwOpenKey, ZwQueryValueKey, ZwClose and MmGetPhysicalMemoryRanges 
+// ZwOpenKey, ZwQueryValueKey, ZwClose and MmGetPhysicalMemoryRanges
 // are already declared in wdm.h / ntddk.h / ntifs.h.
 
 // SystemInformationClass values we need
 #define SystemFirmwareTableInformation 76
+
+// ============================================================================
+// Storage / IOCTL definitions for disk serial capture & patching
+// Defined inline so we don't need to fight include ordering with ntddstor.h.
+// ============================================================================
+
+#ifndef IOCTL_STORAGE_BASE
+#define IOCTL_STORAGE_BASE  ((ULONG)0x0000002dL)  // FILE_DEVICE_MASS_STORAGE
+#endif
+#ifndef IOCTL_STORAGE_QUERY_PROPERTY
+#define IOCTL_STORAGE_QUERY_PROPERTY \
+    CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+typedef enum _HWID_STORAGE_PROPERTY_ID {
+    HwidStorageDeviceProperty = 0,
+} HWID_STORAGE_PROPERTY_ID;
+
+typedef enum _HWID_STORAGE_QUERY_TYPE {
+    HwidPropertyStandardQuery = 0,
+} HWID_STORAGE_QUERY_TYPE;
+
+typedef struct _HWID_STORAGE_PROPERTY_QUERY {
+    ULONG PropertyId;
+    ULONG QueryType;
+    UCHAR AdditionalParameters[1];
+} HWID_STORAGE_PROPERTY_QUERY, *PHWID_STORAGE_PROPERTY_QUERY;
+
+#pragma pack(push, 1)
+typedef struct _HWID_STORAGE_DEVICE_DESCRIPTOR {
+    ULONG  Version;
+    ULONG  Size;
+    UCHAR  DeviceType;
+    UCHAR  DeviceTypeModifier;
+    BOOLEAN RemovableMedia;
+    BOOLEAN CommandQueueing;
+    ULONG  VendorIdOffset;
+    ULONG  ProductIdOffset;
+    ULONG  ProductRevisionOffset;
+    ULONG  SerialNumberOffset;
+    ULONG  BusType;
+    ULONG  RawPropertiesLength;
+    UCHAR  RawDeviceProperties[1];
+} HWID_STORAGE_DEVICE_DESCRIPTOR, *PHWID_STORAGE_DEVICE_DESCRIPTOR;
+#pragma pack(pop)
 
 // ExAllocatePool2 support (Windows 11 / WDK 10.0.22621+)
 #ifndef POOL_FLAG_NON_PAGED
@@ -1341,8 +1386,16 @@ static void hwid_format_vol_serial(PCHAR out, SIZE_T max_chars, UINT16 hi, UINT1
 // Internal: Generate random spoofed HWID values
 // ============================================================================
 
-static VOID generate_spoofed_hwid(PHWID_DATA out_data, UINT64 seed, UINT32 components) {
+static VOID generate_spoofed_hwid(PHWID_DATA out_data, UINT64 seed, UINT32 components,
+                                  PHWID_DATA original) {
     RtlZeroMemory(out_data, sizeof(HWID_DATA));
+
+    // Pass through fields that aren't randomized themselves but need to flow
+    // through to the spoofed view (the adapter index points at the same
+    // registry subkey we captured from, so apply/restore hit the right one).
+    if (original) {
+        out_data->mac_adapter_subkey = original->mac_adapter_subkey;
+    }
 
     if (seed) {
         xs128p_seed(seed);
@@ -1413,6 +1466,26 @@ static VOID generate_spoofed_hwid(PHWID_DATA out_data, UINT64 seed, UINT32 compo
         UINT32 vs_lo = (UINT32)(xs128p_next() & 0xFFFF);
         hwid_format_vol_serial(out_data->volume_serial, HWID_MAX_VOLUME_LEN,
                                (UINT16)vs_hi, (UINT16)vs_lo);
+    }
+
+    // Spoofed Disk Serial — must match the original's length so it fits in
+    // the cached STORAGE_DEVICE_DESCRIPTOR without breaking offsets.  Falls
+    // back to a 12-char hex string when no original is provided.
+    if (components & HWID_COMPONENT_DISK_SERIAL) {
+        SIZE_T target_len = 12;
+        if (original && original->disk_serial[0]) {
+            SIZE_T orig_len = 0;
+            while (orig_len < HWID_MAX_DISK_SERIAL_LEN - 1 && original->disk_serial[orig_len]) {
+                orig_len++;
+            }
+            if (orig_len) target_len = orig_len;
+        }
+        if (target_len >= HWID_MAX_DISK_SERIAL_LEN) target_len = HWID_MAX_DISK_SERIAL_LEN - 1;
+        for (SIZE_T i = 0; i < target_len; i++) {
+            UINT64 r = xs128p_next();
+            out_data->disk_serial[i] = hex_chars[r & 0xF];
+        }
+        out_data->disk_serial[target_len] = '\0';
     }
 
     out_data->components_present = components;
@@ -1707,6 +1780,21 @@ static NTSTATUS registry_capture_machineguid(PHWID_DATA out_data) {
 // physical adapter found (skipping virtual/WAN/miniport adapters).
 // ============================================================================
 
+// Helper: read a 6-byte REG_BINARY MAC value and format to XX-XX-XX-XX-XX-XX.
+static BOOLEAN read_reg_binary_mac(HANDLE hKey, PCWSTR value_name, PCHAR out, ULONG max_chars) {
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 32] = {};
+    ULONG sz = sizeof(buf);
+    UNICODE_STRING vn;
+    RtlInitUnicodeString(&vn, value_name);
+    PKEY_VALUE_PARTIAL_INFORMATION kv = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+    if (!NT_SUCCESS(ZwQueryValueKey(hKey, &vn, KeyValuePartialInformation, buf, sz, &sz)))
+        return FALSE;
+    if (kv->Type != REG_BINARY || kv->DataLength < 6) return FALSE;
+    UINT8* pm = (UINT8*)kv->Data;
+    hwid_format_mac(out, max_chars, pm[0], pm[1], pm[2], pm[3], pm[4], pm[5]);
+    return out[0] != '\0';
+}
+
 // Helper: check if a registry value exists and read it (ANSI).
 static NTSTATUS read_reg_string_ansi(HANDLE hKey, PCWSTR value_name,
                                      PCHAR out_buf, ULONG max_bytes) {
@@ -1850,6 +1938,15 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
         } else if (NT_SUCCESS(read_reg_string_ansi(hAdapter, L"PermanentAddress",
                                                    mac_buf, sizeof(mac_buf))) && mac_buf[0]) {
             found = TRUE;
+        } else if (read_reg_binary_mac(hAdapter, L"PermanentAddress",
+                                       mac_buf, sizeof(mac_buf))) {
+            found = TRUE;
+        } else if (NT_SUCCESS(read_reg_string_ansi(hAdapter, L"MACAddress",
+                                                   mac_buf, sizeof(mac_buf))) && mac_buf[0]) {
+            found = TRUE;
+        } else if (read_reg_binary_mac(hAdapter, L"MACAddress",
+                                       mac_buf, sizeof(mac_buf))) {
+            found = TRUE;
         } else {
             // PhysicalAddress is REG_BINARY (6 raw bytes).
             UCHAR pbuf[256] = {};
@@ -1871,36 +1968,203 @@ static NTSTATUS capture_mac_address(PHWID_DATA out_data) {
                     idx, out_data->mac_address, desc);
                 return STATUS_SUCCESS;
             }
+
+            // ---------------------------------------------------------------
+            // NDIS IOCTL fallback — Realtek PCIe and similar adapters that
+            // never write their MAC to any registry value (the driver reads
+            // it straight from the NIC's EEPROM at runtime).
+            //
+            // Strategy:
+            //   1.  Read NetCfgInstanceId (REG_SZ) from this adapter's class
+            //       subkey to get the {GUID}.
+            //   2.  Build the kernel device path: \Device\{GUID}.
+            //   3.  Open the device object via IoGetDeviceObjectPointer.
+            //   4.  Send IOCTL_NDIS_QUERY_GLOBAL_STATS with input OID
+            //       OID_802_3_PERMANENT_ADDRESS (0x01010101) — NDIS translates
+            //       this legacy IOCTL into an OID query to the miniport and
+            //       returns the 6-byte hardware MAC in the output buffer.
+            //
+            // This call is safe at PASSIVE_LEVEL (the IPC dispatch thread
+            // never raises IRQL before calling capture_mac_address).
+            // ---------------------------------------------------------------
+            {
+#ifndef IOCTL_NDIS_QUERY_GLOBAL_STATS
+#define IOCTL_NDIS_QUERY_GLOBAL_STATS  0x00170002u
+#endif
+#ifndef OID_802_3_PERMANENT_ADDRESS
+#define OID_802_3_PERMANENT_ADDRESS    0x01010101u
+#endif
+                UCHAR gBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 80] = {};
+                ULONG gLen = sizeof(gBuf);
+                UNICODE_STRING guid_vn;
+                RtlInitUnicodeString(&guid_vn, L"NetCfgInstanceId");
+                PKEY_VALUE_PARTIAL_INFORMATION gKv =
+                    (PKEY_VALUE_PARTIAL_INFORMATION)gBuf;
+
+                if (NT_SUCCESS(ZwQueryValueKey(hAdapter, &guid_vn,
+                                               KeyValuePartialInformation,
+                                               gBuf, gLen, &gLen)) &&
+                    gKv->Type == REG_SZ && gKv->DataLength >= 2)
+                {
+                    // Strip trailing embedded null(s) from the GUID string.
+                    ULONG guid_wchars = gKv->DataLength / sizeof(WCHAR);
+                    while (guid_wchars > 0 &&
+                           ((PWCH)gKv->Data)[guid_wchars - 1] == L'\0')
+                        guid_wchars--;
+
+                    // "\Device\" prefix is 8 wide chars; GUID is 38 chars:
+                    // {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+                    static const WCHAR c_dev_prefix[] = L"\\Device\\";
+                    const ULONG prefix_wlen =
+                        (ULONG)(ARRAYSIZE(c_dev_prefix) - 1); /* no null */
+
+                    if (guid_wchars > 0 &&
+                        prefix_wlen + guid_wchars < 78)
+                    {
+                        WCHAR dev_path[80] = {};
+                        memcpy(dev_path,
+                               c_dev_prefix,
+                               prefix_wlen * sizeof(WCHAR));
+                        memcpy(dev_path + prefix_wlen,
+                               gKv->Data,
+                               guid_wchars * sizeof(WCHAR));
+                        dev_path[prefix_wlen + guid_wchars] = L'\0';
+
+                        UNICODE_STRING devPath;
+                        RtlInitUnicodeString(&devPath, dev_path);
+
+                        PFILE_OBJECT pFileObj = NULL;
+                        PDEVICE_OBJECT pDevObj = NULL;
+                        NTSTATUS ndis_st = IoGetDeviceObjectPointer(
+                            &devPath, FILE_READ_DATA, &pFileObj, &pDevObj);
+
+                        if (NT_SUCCESS(ndis_st) && pDevObj) {
+                            ULONG      oid_in   = OID_802_3_PERMANENT_ADDRESS;
+                            UCHAR      mac_out[16] = {};
+                            IO_STATUS_BLOCK ndis_iosb = {};
+                            KEVENT     ndis_evt;
+                            KeInitializeEvent(&ndis_evt,
+                                              NotificationEvent, FALSE);
+
+                            PIRP ndis_irp = IoBuildDeviceIoControlRequest(
+                                IOCTL_NDIS_QUERY_GLOBAL_STATS,
+                                pDevObj,
+                                &oid_in,  sizeof(oid_in),   /* input  */
+                                mac_out,  sizeof(mac_out),  /* output */
+                                FALSE,                      /* not internal */
+                                &ndis_evt,
+                                &ndis_iosb);
+
+                            if (ndis_irp) {
+                                NTSTATUS call_st =
+                                    IoCallDriver(pDevObj, ndis_irp);
+                                if (call_st == STATUS_PENDING) {
+                                    KeWaitForSingleObject(
+                                        &ndis_evt, Executive,
+                                        KernelMode, FALSE, NULL);
+                                }
+                                // IRP is freed by the I/O manager after
+                                // completion — do NOT free it here.
+                                if ((NT_SUCCESS(ndis_iosb.Status) ||
+                                     ndis_iosb.Status ==
+                                         STATUS_BUFFER_OVERFLOW) &&
+                                    (ULONG_PTR)ndis_iosb.Information >= 6)
+                                {
+                                    hwid_format_mac(
+                                        mac_buf, sizeof(mac_buf),
+                                        mac_out[0], mac_out[1], mac_out[2],
+                                        mac_out[3], mac_out[4], mac_out[5]);
+                                    if (mac_buf[0]) {
+                                        found = TRUE;
+                                        KIPC_LOG(
+                                            "[HWID] NDIS IOCTL MAC"
+                                            " (subkey %04u, %s): %s\n",
+                                            idx, desc, mac_buf);
+                                    }
+                                } else {
+                                    KIPC_LOG(
+                                        "[HWID] NDIS IOCTL failed"
+                                        " (subkey %04u): iosb.Status=0x%X"
+                                        " info=%llu\n",
+                                        idx,
+                                        (ULONG)ndis_iosb.Status,
+                                        (ULONG64)ndis_iosb.Information);
+                                }
+                            }
+                            ObDereferenceObject(pFileObj);
+                        } else {
+                            KIPC_LOG(
+                                "[HWID] IoGetDeviceObjectPointer"
+                                " failed for %wZ: 0x%X\n",
+                                &devPath, ndis_st);
+                        }
+                    }
+                }
+            }
+            // ---------------------------------------------------------------
         }
 
         ZwClose(hAdapter);
 
         if (found) {
-            // Normalize "0250F2517406" → "02-50-F2-51-74-06"; pass through
-            // dashed/colon-separated forms unchanged.
-            SIZE_T len = strlen(mac_buf);
-            if (len == 12) {
-                CHAR dash_mac[HWID_MAX_MAC_LEN];
-                PCHAR dm = dash_mac;
-                SIZE_T rem = sizeof(dash_mac);
-                for (int bi = 0; bi < 6; bi++) {
-                    if (rem > 2) {
-                        *dm++ = mac_buf[bi * 2];
-                        *dm++ = mac_buf[bi * 2 + 1];
-                        rem -= 2;
-                    }
-                    if (bi < 5 && rem > 1) { *dm++ = '-'; rem--; }
-                }
-                *dm = '\0';
-                hwid_strncpy(out_data->mac_address, dash_mac, HWID_MAX_MAC_LEN);
-            } else {
-                hwid_strncpy(out_data->mac_address, mac_buf, HWID_MAX_MAC_LEN);
+            // Reject obviously bogus MACs (all zero, all FF). Parses
+            // both dashed/colon-separated and bare-12-hex forms.
+            BOOLEAN bogus = FALSE;
+            UINT8 raw[6] = {};
+            int nibble_idx = 0;
+            for (SIZE_T k = 0; mac_buf[k] && nibble_idx < 12; k++) {
+                CHAR c = mac_buf[k];
+                if (c == '-' || c == ':' || c == ' ') continue;
+                UINT8 v;
+                if (c >= '0' && c <= '9')      v = (UINT8)(c - '0');
+                else if (c >= 'A' && c <= 'F') v = (UINT8)(c - 'A' + 10);
+                else if (c >= 'a' && c <= 'f') v = (UINT8)(c - 'a' + 10);
+                else { bogus = TRUE; break; }
+                int byte_idx = nibble_idx >> 1;
+                if ((nibble_idx & 1) == 0) raw[byte_idx] = (UINT8)(v << 4);
+                else                       raw[byte_idx] |= v;
+                nibble_idx++;
             }
-            out_data->components_present |= HWID_COMPONENT_MAC_ADDRESS;
-            KIPC_LOG(
-                "[HWID] Captured MAC: %s (subkey %04u, %s)\n",
-                out_data->mac_address, idx, desc);
-            got_mac = TRUE;
+            if (nibble_idx != 12) bogus = TRUE;
+            if (!bogus) {
+                BOOLEAN all_zero = TRUE, all_ff = TRUE;
+                for (int k = 0; k < 6; k++) {
+                    if (raw[k] != 0x00) all_zero = FALSE;
+                    if (raw[k] != 0xFF) all_ff = FALSE;
+                }
+                if (all_zero || all_ff) bogus = TRUE;
+            }
+            if (bogus) {
+                KIPC_LOG("[HWID] Rejecting bogus MAC '%s' from subkey %04u (%s)\n",
+                         mac_buf, idx, desc);
+            } else {
+                // Normalize "0250F2517406" → "02-50-F2-51-74-06"; pass through
+                // dashed/colon-separated forms unchanged.
+                SIZE_T len = strlen(mac_buf);
+                if (len == 12) {
+                    CHAR dash_mac[HWID_MAX_MAC_LEN];
+                    PCHAR dm = dash_mac;
+                    SIZE_T rem = sizeof(dash_mac);
+                    for (int bi = 0; bi < 6; bi++) {
+                        if (rem > 2) {
+                            *dm++ = mac_buf[bi * 2];
+                            *dm++ = mac_buf[bi * 2 + 1];
+                            rem -= 2;
+                        }
+                        if (bi < 5 && rem > 1) { *dm++ = '-'; rem--; }
+                    }
+                    *dm = '\0';
+                    hwid_strncpy(out_data->mac_address, dash_mac, HWID_MAX_MAC_LEN);
+                } else {
+                    hwid_strncpy(out_data->mac_address, mac_buf, HWID_MAX_MAC_LEN);
+                }
+                out_data->components_present |= HWID_COMPONENT_MAC_ADDRESS;
+                out_data->mac_adapter_subkey = idx;
+                KIPC_LOG(
+                    "[HWID] Captured MAC: %s (subkey %04u, %s)\n",
+                    out_data->mac_address, idx, desc);
+                got_mac = TRUE;
+            }
         }
     }
 
@@ -1966,6 +2230,264 @@ static NTSTATUS capture_volume_serial(PHWID_DATA out_data) {
     }
 
     return st;
+}
+
+// ============================================================================
+// Disk serial: capture + patch
+//
+// `wmic diskdrive get SerialNumber` resolves Win32_DiskDrive.SerialNumber via
+// IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProperty) → STORAGE_DEVICE_DESCRIPTOR.
+// disk.sys caches that descriptor in its FDO extension as a pool allocation;
+// every subsequent query reads the same cached buffer.  Patching the serial
+// string in the cache makes the change stick for both WMI and direct IOCTL
+// callers without hooking any code.
+//
+// Capture path:
+//   1. Open \Device\HarddiskN\Partition0 (the disk.sys FDO).
+//   2. Send IOCTL_STORAGE_QUERY_PROPERTY with PropertyId=StorageDeviceProperty.
+//   3. Extract Serial at descriptor->SerialNumberOffset.
+//
+// Patch path:
+//   1. Resolve the FDO via IoGetDeviceObjectPointer.
+//   2. Scan DeviceExtension (first ~0x800 bytes) for any 8-byte-aligned
+//      pointer whose target looks like STORAGE_DEVICE_DESCRIPTOR AND whose
+//      serial string at SerialNumberOffset matches the captured original.
+//   3. Overwrite the serial bytes in place. Spoofed serial must be ≤ original
+//      length so the rest of the descriptor stays valid.
+// ============================================================================
+
+// Trim leading whitespace/zero bytes commonly returned by storage stacks.
+static PCHAR disk_trim_leading(PCHAR s) {
+    while (s && *s && (*s == ' ' || *s == '\t')) s++;
+    return s;
+}
+
+// Send IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceProperty) to a disk handle and
+// fill `out_serial` with the trimmed serial string. `raw_buf` (out) receives a
+// copy of the raw descriptor bytes so the caller can use the exact serial that
+// will appear in the cache (some drivers prefix with spaces).
+static NTSTATUS disk_query_descriptor(HANDLE hDisk, PCHAR out_serial,
+                                      ULONG out_max,
+                                      PUCHAR raw_buf, ULONG raw_buf_size,
+                                      PULONG raw_buf_used) {
+    if (raw_buf_used) *raw_buf_used = 0;
+    if (out_serial && out_max) out_serial[0] = '\0';
+
+    HWID_STORAGE_PROPERTY_QUERY query = {};
+    query.PropertyId = (ULONG)HwidStorageDeviceProperty;
+    query.QueryType  = (ULONG)HwidPropertyStandardQuery;
+
+    IO_STATUS_BLOCK iosb = {};
+    NTSTATUS st = ZwDeviceIoControlFile(hDisk, NULL, NULL, NULL, &iosb,
+                                        IOCTL_STORAGE_QUERY_PROPERTY,
+                                        &query, sizeof(query),
+                                        raw_buf, raw_buf_size);
+    if (!NT_SUCCESS(st)) return st;
+
+    if (iosb.Information < sizeof(HWID_STORAGE_DEVICE_DESCRIPTOR))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    PHWID_STORAGE_DEVICE_DESCRIPTOR desc = (PHWID_STORAGE_DEVICE_DESCRIPTOR)raw_buf;
+    if (desc->SerialNumberOffset == 0 ||
+        desc->SerialNumberOffset >= raw_buf_size) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (raw_buf_used) *raw_buf_used = (ULONG)iosb.Information;
+
+    if (out_serial && out_max) {
+        PCHAR raw_serial = (PCHAR)(raw_buf + desc->SerialNumberOffset);
+        PCHAR trimmed = disk_trim_leading(raw_serial);
+        hwid_strncpy(out_serial, trimmed, out_max);
+        // Drop any trailing whitespace too.
+        SIZE_T n = 0;
+        while (out_serial[n]) n++;
+        while (n > 0 && (out_serial[n - 1] == ' ' || out_serial[n - 1] == '\t')) {
+            out_serial[--n] = '\0';
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+// Open the disk.sys FDO for HarddiskN\Partition0. Returns NULL on failure.
+static HANDLE disk_open_partition0(ULONG disk_index) {
+    WCHAR path_buf[64];
+    static const WCHAR pfx[] = L"\\Device\\Harddisk";
+    static const WCHAR sfx[] = L"\\Partition0";
+    ULONG idx = 0;
+    for (ULONG i = 0; pfx[i] && idx + 1 < ARRAYSIZE(path_buf); i++) path_buf[idx++] = pfx[i];
+    // Append disk_index in decimal (0-99 covers HWID_MAX_DISKS comfortably).
+    if (disk_index >= 10) path_buf[idx++] = (WCHAR)(L'0' + (disk_index / 10));
+    path_buf[idx++] = (WCHAR)(L'0' + (disk_index % 10));
+    for (ULONG i = 0; sfx[i] && idx + 1 < ARRAYSIZE(path_buf); i++) path_buf[idx++] = sfx[i];
+    path_buf[idx] = L'\0';
+
+    UNICODE_STRING devPath;
+    RtlInitUnicodeString(&devPath, path_buf);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &devPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    HANDLE hDisk = NULL;
+    IO_STATUS_BLOCK iosb = {};
+    NTSTATUS st = ZwCreateFile(&hDisk, GENERIC_READ | SYNCHRONIZE, &oa, &iosb,
+                               NULL, FILE_ATTRIBUTE_NORMAL,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(st)) return NULL;
+    return hDisk;
+}
+
+// Capture the first non-empty disk serial we can find. Writes it into
+// out_data->disk_serial and sets HWID_COMPONENT_DISK_SERIAL.
+static NTSTATUS capture_disk_serial(PHWID_DATA out_data) {
+    if (!out_data) return STATUS_INVALID_PARAMETER;
+
+    for (ULONG i = 0; i < HWID_MAX_DISKS; i++) {
+        HANDLE hDisk = disk_open_partition0(i);
+        if (!hDisk) continue;
+
+        UCHAR raw[1024] = {};
+        ULONG raw_used = 0;
+        CHAR serial[HWID_MAX_DISK_SERIAL_LEN] = {};
+        NTSTATUS st = disk_query_descriptor(hDisk, serial, sizeof(serial),
+                                            raw, sizeof(raw), &raw_used);
+        ZwClose(hDisk);
+        if (!NT_SUCCESS(st) || !serial[0]) continue;
+
+        hwid_strncpy(out_data->disk_serial, serial, HWID_MAX_DISK_SERIAL_LEN);
+        out_data->components_present |= HWID_COMPONENT_DISK_SERIAL;
+        KIPC_LOG("[HWID] Captured disk%u serial: '%s'\n", i, out_data->disk_serial);
+        return STATUS_SUCCESS;
+    }
+
+    KIPC_LOG("[HWID] capture_disk_serial: no disk responded\n");
+    return STATUS_NOT_FOUND;
+}
+
+// Validate that `ptr` points to something that looks like a cached
+// STORAGE_DEVICE_DESCRIPTOR whose serial matches `needle`. Wrapped in SEH —
+// the FDO extension scan deliberately walks possibly-bogus pointers.
+static BOOLEAN disk_descriptor_matches(ULONG_PTR ptr, PCHAR needle, SIZE_T needle_len,
+                                       PHWID_STORAGE_DEVICE_DESCRIPTOR* out_desc,
+                                       PCHAR* out_serial_addr) {
+    if (out_desc) *out_desc = NULL;
+    if (out_serial_addr) *out_serial_addr = NULL;
+
+    // Must be a kernel pool pointer (sign bit set on x64).
+    if (ptr < 0xFFFF800000000000ULL) return FALSE;
+    if (ptr & 0x7) return FALSE;
+
+    __try {
+        ULONG version = *(volatile PULONG)ptr;
+        ULONG size    = *(volatile PULONG)(ptr + 4);
+
+        if (version < 0x28 || version > 0x200) return FALSE;
+        if (size < 0x28 || size > 0x2000)      return FALSE;
+
+        ULONG serial_off = *(volatile PULONG)(ptr + 24);
+        if (serial_off == 0 || serial_off >= size) return FALSE;
+
+        PCHAR cand_serial = (PCHAR)(ptr + serial_off);
+
+        // Compare strict: needle must be a prefix of cand_serial (cand may have
+        // leading whitespace that we trimmed at capture — accept either case).
+        PCHAR scan = cand_serial;
+        // Skip leading whitespace on the candidate
+        while (*scan == ' ' || *scan == '\t') scan++;
+        for (SIZE_T j = 0; j < needle_len; j++) {
+            if (scan[j] != needle[j]) return FALSE;
+        }
+
+        if (out_desc) *out_desc = (PHWID_STORAGE_DEVICE_DESCRIPTOR)ptr;
+        if (out_serial_addr) *out_serial_addr = scan;
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+// Walk the FDO extension of every accessible \Device\HarddiskN\Partition0,
+// patch the cached descriptor's serial string with `new_serial`.
+// Returns STATUS_SUCCESS if at least one descriptor was patched.
+static NTSTATUS disk_patch_serial(PCHAR orig_serial, PCHAR new_serial) {
+    if (!orig_serial || !new_serial || !orig_serial[0] || !new_serial[0])
+        return STATUS_INVALID_PARAMETER;
+
+    SIZE_T orig_len = strlen(orig_serial);
+    SIZE_T new_len  = strlen(new_serial);
+    // New serial must fit within the original's length (so we preserve any
+    // trailing bytes — like the null terminator).
+    SIZE_T copy_len = (new_len < orig_len) ? new_len : orig_len;
+
+    NTSTATUS overall = STATUS_NOT_FOUND;
+
+    for (ULONG i = 0; i < HWID_MAX_DISKS; i++) {
+        WCHAR path_buf[64];
+        static const WCHAR pfx[] = L"\\Device\\Harddisk";
+        static const WCHAR sfx[] = L"\\Partition0";
+        ULONG idx = 0;
+        for (ULONG k = 0; pfx[k] && idx + 1 < ARRAYSIZE(path_buf); k++) path_buf[idx++] = pfx[k];
+        if (i >= 10) path_buf[idx++] = (WCHAR)(L'0' + (i / 10));
+        path_buf[idx++] = (WCHAR)(L'0' + (i % 10));
+        for (ULONG k = 0; sfx[k] && idx + 1 < ARRAYSIZE(path_buf); k++) path_buf[idx++] = sfx[k];
+        path_buf[idx] = L'\0';
+
+        UNICODE_STRING devPath;
+        RtlInitUnicodeString(&devPath, path_buf);
+        PFILE_OBJECT pFile = NULL;
+        PDEVICE_OBJECT pDevObj = NULL;
+        if (!NT_SUCCESS(IoGetDeviceObjectPointer(&devPath, FILE_READ_DATA,
+                                                 &pFile, &pDevObj))) {
+            continue;
+        }
+
+        PVOID fdoExt = pDevObj ? pDevObj->DeviceExtension : NULL;
+        if (!fdoExt) {
+            if (pFile) ObDereferenceObject(pFile);
+            continue;
+        }
+
+        // Walk the FDO extension as an array of ULONG_PTRs. Disk.sys's
+        // FUNCTIONAL_DEVICE_EXTENSION is bounded; 0x800 covers all current
+        // Windows builds, with SEH catching any over-read.
+        PULONG_PTR slots = (PULONG_PTR)fdoExt;
+        SIZE_T scan_count = 0x800 / sizeof(ULONG_PTR);
+
+        BOOLEAN patched_this = FALSE;
+        for (SIZE_T s = 0; s < scan_count; s++) {
+            ULONG_PTR p = 0;
+            __try {
+                p = slots[s];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                break;
+            }
+            PHWID_STORAGE_DEVICE_DESCRIPTOR desc = NULL;
+            PCHAR serial_addr = NULL;
+            if (!disk_descriptor_matches(p, orig_serial, orig_len, &desc, &serial_addr))
+                continue;
+
+            __try {
+                // Overwrite the serial bytes. Preserve null terminator if new < orig.
+                memcpy(serial_addr, new_serial, copy_len);
+                if (copy_len < orig_len) {
+                    // Pad the remainder with NULs to truncate cleanly.
+                    serial_addr[copy_len] = '\0';
+                }
+                patched_this = TRUE;
+                KIPC_LOG("[HWID] Patched disk%u serial in cached descriptor %p "
+                         "('%s' → '%s')\n",
+                         i, desc, orig_serial, new_serial);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                KIPC_LOG("[HWID] Exception while patching disk%u serial\n", i);
+            }
+            break; // Only one cached descriptor per FDO.
+        }
+
+        if (pFile) ObDereferenceObject(pFile);
+        if (patched_this) overall = STATUS_SUCCESS;
+    }
+
+    return overall;
 }
 
 // ============================================================================
@@ -2198,6 +2720,12 @@ namespace HWIDSpoofer {
             KIPC_LOG( "[HWID] Volume serial capture failed: 0x%X\n", vol_st);
         }
 
+        // Capture physical disk serial via IOCTL_STORAGE_QUERY_PROPERTY.
+        NTSTATUS disk_st = capture_disk_serial(&staged);
+        if (!NT_SUCCESS(disk_st)) {
+            KIPC_LOG( "[HWID] Disk serial capture failed: 0x%X\n", disk_st);
+        }
+
         // Timestamp — safe at any IRQL but we take it here for ordering.
         LARGE_INTEGER systime;
         KeQuerySystemTime(&systime);
@@ -2240,6 +2768,36 @@ namespace HWIDSpoofer {
         return st;
     }
 
+    // Build "\Registry\Machine\SYSTEM\CurrentControlSet\Control\Class\{NDIS}\NNNN"
+    // for the given adapter subkey index.  Returns wchar count written (excluding
+    // null) or 0 on overflow.
+    static SIZE_T build_mac_subkey_path(WCHAR* out, SIZE_T max_chars, UINT32 subkey_idx) {
+        static const WCHAR pfx[] =
+            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\";
+        const SIZE_T pfx_len = (sizeof(pfx) / sizeof(WCHAR)) - 1;
+        if (max_chars < pfx_len + 5) return 0;
+        memcpy(out, pfx, pfx_len * sizeof(WCHAR));
+        out[pfx_len + 0] = (WCHAR)(L'0' + ((subkey_idx / 1000) % 10));
+        out[pfx_len + 1] = (WCHAR)(L'0' + ((subkey_idx /  100) % 10));
+        out[pfx_len + 2] = (WCHAR)(L'0' + ((subkey_idx /   10) % 10));
+        out[pfx_len + 3] = (WCHAR)(L'0' + (subkey_idx % 10));
+        out[pfx_len + 4] = L'\0';
+        return pfx_len + 4;
+    }
+
+    // Strip any "-" or ":" from a MAC string. The Realtek/Intel/RTL drivers
+    // expect NetworkAddress to be a bare 12-char hex string.
+    static void mac_strip_separators(PCHAR src, PCHAR dst, SIZE_T dst_max) {
+        SIZE_T di = 0;
+        for (SIZE_T si = 0; src[si] && di + 1 < dst_max; si++) {
+            CHAR c = src[si];
+            if (c == '-' || c == ':' || c == ' ') continue;
+            dst[di++] = c;
+        }
+        dst[di] = '\0';
+    }
+
     NTSTATUS ApplySpoof(UINT32 components, UINT64 random_seed) {
         NTSTATUS result = STATUS_SUCCESS;
 
@@ -2275,58 +2833,69 @@ namespace HWIDSpoofer {
             RestoreOriginals();
         }
 
-        // Re-enter the protected region for the in-memory mutation.
+        // Re-enter the protected region only long enough to generate the
+        // spoofed values into g_spoofed_hwid and snapshot what we need.
+        // All physical-memory patches and Zw* calls happen at PASSIVE_LEVEL
+        // OUTSIDE the lock — see "IRQL discipline" note above.
+        HWID_DATA snap_spoof;
+        HWID_DATA snap_orig;
         ExAcquireFastMutex(&g_hwid_lock);
         {
-            // Re-check state — RestoreOriginals could have raced with a
-            // concurrent Cleanup.  Bail cleanly if so.
             if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
                 g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
                 ExReleaseFastMutex(&g_hwid_lock);
                 return STATUS_INVALID_DEVICE_STATE;
             }
-
-            // Generate spoofed values
-            generate_spoofed_hwid(&g_spoofed_hwid, random_seed, components);
-
-            // ── Step 1: Apply SMBIOS physical memory patch (best-effort) ──
-            // GATED behind HWID_SPOOFER_PHYS_PATCH_ENABLED.  See hwid_spoofer.hpp
-            // for the failure modes that make this path BSOD on common Win10/11
-            // configurations.  When disabled, ApplySpoof falls through to the
-            // registry + (TODO) MSSMBIOS-pool patch which is BSOD-free.
-#if HWID_SPOOFER_PHYS_PATCH_ENABLED
-            if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
-                NTSTATUS patch_st = smbios_patch_hwid(&g_spoofed_hwid);
-                if (!NT_SUCCESS(patch_st)) {
-                    KIPC_LOG(
-                        "[HWID] SMBIOS physical patch failed: 0x%X (continuing with reg writes)\n", patch_st);
-                    hwid_restore_all_backups();
-                    // DON'T return — continue to write registry values
-                } else {
-                    KIPC_LOG( "[HWID] SMBIOS physical patched OK\n");
-                }
-            }
-#else
-            // Physical patch disabled — log once so the operator knows why
-            // SMBIOS values don't appear changed in WMI / dmidecode output.
-            if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
-                KIPC_LOG(
-                    "[HWID] SMBIOS physical patch SKIPPED (HWID_SPOOFER_PHYS_PATCH_ENABLED=0) — "
-                    "registry overrides still applied.  Anti-cheats querying the live SMBIOS "
-                    "table will see the original values; those that hit the registry-cached "
-                    "MSSMBIOS values (most do) will see the spoof.\n");
-            }
-#endif
+            generate_spoofed_hwid(&g_spoofed_hwid, random_seed, components,
+                                  &g_original_hwid);
+            memcpy(&snap_spoof, &g_spoofed_hwid, sizeof(HWID_DATA));
+            memcpy(&snap_orig,  &g_original_hwid, sizeof(HWID_DATA));
         }
-        // ─── Drop the lock BEFORE any Zw* registry call ──────────────────
-        // Snapshot the spoofed values we need into stack locals so the
-        // unprotected window below can't see torn writes from a concurrent
-        // ApplySpoof.  CHAR arrays are small enough to copy cheaply.
+        ExReleaseFastMutex(&g_hwid_lock);
+
+        // ── Step 1: Apply SMBIOS physical memory patch (best-effort) ──
+        // GATED behind HWID_SPOOFER_PHYS_PATCH_ENABLED.  smbios_patch_hwid
+        // also writes the mssmbios registry mirror, which needs PASSIVE_LEVEL.
+#if HWID_SPOOFER_PHYS_PATCH_ENABLED
+        if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
+            NTSTATUS patch_st = smbios_patch_hwid(&snap_spoof);
+            if (!NT_SUCCESS(patch_st)) {
+                KIPC_LOG(
+                    "[HWID] SMBIOS physical patch failed: 0x%X (continuing with reg writes)\n", patch_st);
+                hwid_restore_all_backups();
+            } else {
+                KIPC_LOG( "[HWID] SMBIOS physical patched OK\n");
+            }
+        }
+#else
+        if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
+            KIPC_LOG(
+                "[HWID] SMBIOS physical patch SKIPPED (HWID_SPOOFER_PHYS_PATCH_ENABLED=0)\n");
+        }
+#endif
+
+        // ── Step 1b: Patch the cached STORAGE_DEVICE_DESCRIPTOR ──
+        // Uses IoGetDeviceObjectPointer / SEH pointer scan — PASSIVE_LEVEL only.
+        if ((components & HWID_COMPONENT_DISK_SERIAL) &&
+            snap_orig.disk_serial[0] && snap_spoof.disk_serial[0]) {
+            NTSTATUS dst = disk_patch_serial(snap_orig.disk_serial,
+                                             snap_spoof.disk_serial);
+            if (!NT_SUCCESS(dst)) {
+                KIPC_LOG("[HWID] Disk serial patch failed: 0x%X\n", dst);
+            } else {
+                KIPC_LOG("[HWID] Disk serial patched (cache)\n");
+            }
+        }
+
+        // Snapshot the strings the registry writes below need (still at
+        // PASSIVE_LEVEL — these locals exist solely for symmetry with the
+        // previous structure of the function).
         CHAR snap_machine_guid[HWID_MAX_GUID_LEN];
         CHAR snap_mac_address [HWID_MAX_MAC_LEN];
-        memcpy(snap_machine_guid, g_spoofed_hwid.machine_guid, HWID_MAX_GUID_LEN);
-        memcpy(snap_mac_address,  g_spoofed_hwid.mac_address,  HWID_MAX_MAC_LEN);
-        ExReleaseFastMutex(&g_hwid_lock);
+        UINT32 snap_mac_subkey;
+        memcpy(snap_machine_guid, snap_spoof.machine_guid, HWID_MAX_GUID_LEN);
+        memcpy(snap_mac_address,  snap_spoof.mac_address,  HWID_MAX_MAC_LEN);
+        snap_mac_subkey = snap_spoof.mac_adapter_subkey;
 
         // ── Step 2: Write spoofed MachineGuid to registry (PASSIVE_LEVEL) ──
         if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
@@ -2348,28 +2917,39 @@ namespace HWIDSpoofer {
         }
 
         // ── Step 3: Write spoofed MAC to registry (PASSIVE_LEVEL) ──
+        // Target the adapter subkey we captured FROM (not a hardcoded 0001/0000).
+        // NDIS miniport drivers expect NetworkAddress as a bare 12-hex-char
+        // string with no separators.
         if ((components & HWID_COMPONENT_MAC_ADDRESS) && snap_mac_address[0]) {
-            static const WCHAR* mac_paths[] = {
-                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
-                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
-            };
-            for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
+            CHAR bare_mac[HWID_MAX_MAC_LEN];
+            mac_strip_separators(snap_mac_address, bare_mac, sizeof(bare_mac));
+
+            WCHAR path_buf[160];
+            BOOLEAN wrote = FALSE;
+            if (build_mac_subkey_path(path_buf, ARRAYSIZE(path_buf), snap_mac_subkey) > 0) {
                 HANDLE hKey = NULL;
                 UNICODE_STRING kp;
-                RtlInitUnicodeString(&kp, mac_paths[mi]);
+                RtlInitUnicodeString(&kp, path_buf);
                 OBJECT_ATTRIBUTES oa;
                 InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
                 if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                    NTSTATUS ws = write_reg_string(&hKey, L"NetworkAddress", snap_mac_address);
+                    NTSTATUS ws = write_reg_string(&hKey, L"NetworkAddress", bare_mac);
                     ZwClose(hKey);
                     if (NT_SUCCESS(ws)) {
-                        KIPC_LOG( "[HWID] MAC NetworkAddress written\n");
-                        break;
+                        KIPC_LOG("[HWID] MAC NetworkAddress written to subkey %04u: %s\n",
+                                 snap_mac_subkey, bare_mac);
+                        wrote = TRUE;
+                    } else {
+                        KIPC_LOG("[HWID] MAC NetworkAddress write failed (subkey %04u): 0x%X\n",
+                                 snap_mac_subkey, ws);
                     }
+                } else {
+                    KIPC_LOG("[HWID] Could not open MAC subkey %04u for write\n",
+                             snap_mac_subkey);
                 }
+            }
+            if (!wrote) {
+                KIPC_LOG("[HWID] MAC spoof persists in driver memory but no NetworkAddress was written\n");
             }
         }
 
@@ -2394,24 +2974,46 @@ namespace HWIDSpoofer {
         // detailed rationale — the BSOD this guards against is IRQL_NOT_
         // LESS_OR_EQUAL on the first ZwOpenKey while the lock is held.
 
+        // Snapshot everything we need OUTSIDE the lock so the patch passes
+        // (which call IoGetDeviceObjectPointer / Zw*) all run at PASSIVE_LEVEL.
+        HWID_DATA snap_spoof;
+        HWID_DATA snap_orig;
         ExAcquireFastMutex(&g_hwid_lock);
         if (!hwid_is_spoof_active()) {
             ExReleaseFastMutex(&g_hwid_lock);
             KIPC_LOG( "[HWID] RestoreOriginals: not spoofed\n");
             return STATUS_SUCCESS;
         }
+        memcpy(&snap_spoof, &g_spoofed_hwid, sizeof(HWID_DATA));
+        memcpy(&snap_orig,  &g_original_hwid, sizeof(HWID_DATA));
+        ExReleaseFastMutex(&g_hwid_lock);
 
-        // Restore physical memory patches under the lock — these touch
-        // pool-resident backup buffers and don't issue Zw* calls.
+        // Restore physical memory patches — pool-resident backups, safe.
 #if HWID_SPOOFER_PHYS_PATCH_ENABLED
         hwid_restore_all_backups();
 #endif
 
-        // Snapshot the original MachineGuid for the registry write below,
-        // then drop the lock before any Zw* call.
+        // Restore the cached disk descriptor by writing the original serial
+        // back over the spoofed one.
+        if ((snap_spoof.components_present & HWID_COMPONENT_DISK_SERIAL) &&
+            snap_orig.disk_serial[0] && snap_spoof.disk_serial[0]) {
+            NTSTATUS dst = disk_patch_serial(snap_spoof.disk_serial,
+                                             snap_orig.disk_serial);
+            if (!NT_SUCCESS(dst)) {
+                KIPC_LOG("[HWID] Disk serial restore failed: 0x%X\n", dst);
+            } else {
+                KIPC_LOG("[HWID] Disk serial restored in cache\n");
+            }
+        }
+
+        // Pull the GUID + MAC subkey we need below into named locals.
         CHAR snap_orig_guid[HWID_MAX_GUID_LEN];
-        memcpy(snap_orig_guid, g_original_hwid.machine_guid, HWID_MAX_GUID_LEN);
-        ExReleaseFastMutex(&g_hwid_lock);
+        UINT32 snap_orig_mac_subkey = 0;
+        memcpy(snap_orig_guid, snap_orig.machine_guid, HWID_MAX_GUID_LEN);
+        snap_orig_mac_subkey = snap_spoof.mac_adapter_subkey;
+        if (snap_orig_mac_subkey == 0) {
+            snap_orig_mac_subkey = snap_orig.mac_adapter_subkey;
+        }
 
         // Restore MachineGuid in registry (PASSIVE_LEVEL).
         if (snap_orig_guid[0]) {
@@ -2428,24 +3030,23 @@ namespace HWIDSpoofer {
             }
         }
 
-        // Remove NetworkAddress override (delete it so hardware MAC is used again)
-        static const WCHAR* rst_mac[] = {
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-            L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
-        };
-        for (int mi = 0; mi < ARRAYSIZE(rst_mac); mi++) {
-            HANDLE hKey = NULL;
-            UNICODE_STRING kp2;
-            RtlInitUnicodeString(&kp2, rst_mac[mi]);
-            OBJECT_ATTRIBUTES oa2;
-            InitializeObjectAttributes(&oa2, &kp2, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-            if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa2))) {
-                UNICODE_STRING vn;
-                RtlInitUnicodeString(&vn, L"NetworkAddress");
-                ZwDeleteValueKey(hKey, &vn);
-                ZwClose(hKey);
+        // Remove NetworkAddress override on the adapter subkey we wrote to.
+        {
+            WCHAR path_buf[160];
+            if (build_mac_subkey_path(path_buf, ARRAYSIZE(path_buf), snap_orig_mac_subkey) > 0) {
+                HANDLE hKey = NULL;
+                UNICODE_STRING kp2;
+                RtlInitUnicodeString(&kp2, path_buf);
+                OBJECT_ATTRIBUTES oa2;
+                InitializeObjectAttributes(&oa2, &kp2, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+                if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa2))) {
+                    UNICODE_STRING vn;
+                    RtlInitUnicodeString(&vn, L"NetworkAddress");
+                    ZwDeleteValueKey(hKey, &vn);
+                    ZwClose(hKey);
+                    KIPC_LOG("[HWID] MAC NetworkAddress removed from subkey %04u\n",
+                             snap_orig_mac_subkey);
+                }
             }
         }
 
@@ -2516,20 +3117,33 @@ namespace HWIDSpoofer {
             RestoreOriginals();
         }
 
-        // Stage the custom payload into our spoofed slot under the lock.
+        // Stage the custom payload into our spoofed slot under the lock,
+        // then snapshot what the patches below need and drop the lock so
+        // every Zw* / IoGetDeviceObjectPointer runs at PASSIVE_LEVEL.
+        HWID_DATA snap_spoof;
+        HWID_DATA snap_orig;
         ExAcquireFastMutex(&g_hwid_lock);
-        if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
-            g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
-            ExReleaseFastMutex(&g_hwid_lock);
-            return STATUS_INVALID_DEVICE_STATE;
+        {
+            if (g_hwid_state == HWID_STATE::HWID_STATE_UNINITIALIZED ||
+                g_hwid_state == HWID_STATE::HWID_STATE_ERROR) {
+                ExReleaseFastMutex(&g_hwid_lock);
+                return STATUS_INVALID_DEVICE_STATE;
+            }
+            RtlZeroMemory(&g_spoofed_hwid, sizeof(g_spoofed_hwid));
+            memcpy(&g_spoofed_hwid, data, sizeof(HWID_DATA));
+            g_spoofed_hwid.components_present = components;
+            // Inherit captured subkey if the caller didn't supply one.
+            if (g_spoofed_hwid.mac_adapter_subkey == 0) {
+                g_spoofed_hwid.mac_adapter_subkey = g_original_hwid.mac_adapter_subkey;
+            }
+            memcpy(&snap_spoof, &g_spoofed_hwid, sizeof(HWID_DATA));
+            memcpy(&snap_orig,  &g_original_hwid, sizeof(HWID_DATA));
         }
-        RtlZeroMemory(&g_spoofed_hwid, sizeof(g_spoofed_hwid));
-        memcpy(&g_spoofed_hwid, data, sizeof(HWID_DATA));
-        g_spoofed_hwid.components_present = components;
+        ExReleaseFastMutex(&g_hwid_lock);
 
 #if HWID_SPOOFER_PHYS_PATCH_ENABLED
         if (components & (HWID_COMPONENT_SMBIOS_UUID | HWID_COMPONENT_SMBIOS_SERIALS)) {
-            NTSTATUS st = smbios_patch_hwid(&g_spoofed_hwid);
+            NTSTATUS st = smbios_patch_hwid(&snap_spoof);
             if (!NT_SUCCESS(st)) {
                 KIPC_LOG( "[HWID] ApplyCustom SMBIOS patch failed: 0x%X (continuing)\n", st);
                 hwid_restore_all_backups();
@@ -2542,13 +3156,22 @@ namespace HWIDSpoofer {
         }
 #endif
 
-        // Snapshot the strings we need for the registry writes, then drop
-        // the lock before any Zw* call.
+        if ((components & HWID_COMPONENT_DISK_SERIAL) &&
+            snap_orig.disk_serial[0] && snap_spoof.disk_serial[0]) {
+            NTSTATUS dst = disk_patch_serial(snap_orig.disk_serial,
+                                             snap_spoof.disk_serial);
+            if (!NT_SUCCESS(dst)) {
+                KIPC_LOG("[HWID] ApplyCustom: disk serial patch failed: 0x%X\n", dst);
+            }
+        }
+
+        // Snapshot the strings the registry writes below need.
         CHAR snap_guid[HWID_MAX_GUID_LEN];
         CHAR snap_mac [HWID_MAX_MAC_LEN];
-        memcpy(snap_guid, g_spoofed_hwid.machine_guid, HWID_MAX_GUID_LEN);
-        memcpy(snap_mac,  g_spoofed_hwid.mac_address,  HWID_MAX_MAC_LEN);
-        ExReleaseFastMutex(&g_hwid_lock);
+        UINT32 snap_subkey;
+        memcpy(snap_guid, snap_spoof.machine_guid, HWID_MAX_GUID_LEN);
+        memcpy(snap_mac,  snap_spoof.mac_address,  HWID_MAX_MAC_LEN);
+        snap_subkey = snap_spoof.mac_adapter_subkey;
 
         // ── Registry writes at PASSIVE_LEVEL ──
         if (components & HWID_COMPONENT_REGISTRY_MACHINEGUID) {
@@ -2566,23 +3189,21 @@ namespace HWIDSpoofer {
         }
 
         if ((components & HWID_COMPONENT_MAC_ADDRESS) && snap_mac[0]) {
-            static const WCHAR* mac_paths[] = {
-                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0001",
-                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-                L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\0000",
-            };
-            for (int mi = 0; mi < ARRAYSIZE(mac_paths); mi++) {
+            CHAR bare_mac[HWID_MAX_MAC_LEN];
+            mac_strip_separators(snap_mac, bare_mac, sizeof(bare_mac));
+
+            WCHAR path_buf[160];
+            if (build_mac_subkey_path(path_buf, ARRAYSIZE(path_buf), snap_subkey) > 0) {
                 HANDLE hKey = NULL;
                 UNICODE_STRING kp;
-                RtlInitUnicodeString(&kp, mac_paths[mi]);
+                RtlInitUnicodeString(&kp, path_buf);
                 OBJECT_ATTRIBUTES oa;
                 InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
                 if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_WRITE, &oa))) {
-                    write_reg_string(&hKey, L"NetworkAddress", snap_mac);
+                    write_reg_string(&hKey, L"NetworkAddress", bare_mac);
                     ZwClose(hKey);
-                    KIPC_LOG( "[HWID] ApplyCustom: MAC written\n");
-                    break;
+                    KIPC_LOG("[HWID] ApplyCustom: MAC %s written to subkey %04u\n",
+                             bare_mac, snap_subkey);
                 }
             }
         }
@@ -2677,6 +3298,7 @@ namespace HWIDSpoofer {
         (void)registry_capture_machineguid(&fresh);
         (void)capture_mac_address(&fresh);
         (void)capture_volume_serial(&fresh);
+        (void)capture_disk_serial(&fresh);
 
         LARGE_INTEGER systime;
         KeQuerySystemTime(&systime);

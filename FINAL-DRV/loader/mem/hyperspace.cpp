@@ -4,7 +4,7 @@
 #include "phys.hpp"
 #include "page_table.hpp"
 #include "validation.hpp"
-#include "pt_hook.hpp"
+#include "pt_patch.hpp"
 #include "../utils/raii.hpp"
 namespace hyperspace {
 

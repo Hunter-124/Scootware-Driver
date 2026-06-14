@@ -67,7 +67,7 @@
 // MmMapIoSpaceEx-into-firmware-page step is skipped.
 // =============================================================================
 #ifndef HWID_SPOOFER_PHYS_PATCH_ENABLED
-#define HWID_SPOOFER_PHYS_PATCH_ENABLED 0
+#define HWID_SPOOFER_PHYS_PATCH_ENABLED 1
 #endif
 
 #include <ntifs.h>
@@ -86,6 +86,7 @@
 #define HWID_COMPONENT_REGISTRY_MACHINEGUID (1 << 2)
 #define HWID_COMPONENT_VOLUME_SERIAL     (1 << 3)
 #define HWID_COMPONENT_MAC_ADDRESS       (1 << 4)
+#define HWID_COMPONENT_DISK_SERIAL       (1 << 5)
 #define HWID_COMPONENT_ALL               (0xFFFFFFFF)
 
 // Maximum lengths for stored HWID strings
@@ -93,7 +94,10 @@
 #define HWID_MAX_GUID_LEN      40
 #define HWID_MAX_MAC_LEN       18
 #define HWID_MAX_VOLUME_LEN    128
+#define HWID_MAX_DISK_SERIAL_LEN  64
 #define HWID_MAX_REG_VALUE     256
+// Maximum number of physical disks we attempt to walk for serial spoofing.
+#define HWID_MAX_DISKS         8
 
 // ============================================================================
 // Stored HWID values (original + spoofed)
@@ -116,6 +120,10 @@ typedef struct _HWID_DATA {
 
     // --- MAC Address ---
     CHAR    mac_address[HWID_MAX_MAC_LEN];               // Primary adapter MAC as XX-XX-XX-XX-XX-XX
+    UINT32  mac_adapter_subkey;                          // Class\NNNN index of the captured adapter (for restore)
+
+    // --- Disk Serial (wmic diskdrive get SerialNumber) ---
+    CHAR    disk_serial[HWID_MAX_DISK_SERIAL_LEN];       // Primary physical disk serial number
 
     // --- Metadata ---
     UINT64  timestamp;                                   // When this data was saved

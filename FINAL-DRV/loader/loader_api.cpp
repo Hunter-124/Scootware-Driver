@@ -4,15 +4,15 @@
 // PT-injector C++ subsystem.  This TU must NOT include any FINAL-DRV-specific
 // headers (no CR3.h, no driver.cpp internals).
 
-#include "injector_api.hpp"
-#include "injector_globals_init.hpp"  // injector_init_globals + pml4 fwd decl
+#include "loader_api.hpp"
+#include "loader_globals_init.hpp"  // injector_init_globals + pml4 fwd decl
 #include "def/globals.hpp"
 #include "def/def.hpp"
 #include "mem/mem.hpp"
 #include "mem/phys.hpp"
 #include "utils/raii.hpp"
 #include "../kdebug.h"        // KIPC_LOG — compiles to no-op in Release
-#include "../stealth_alloc.h" // STEALTH_POOL_ALLOC — randomized tags
+#include "../private_pool.h" // STEALTH_POOL_ALLOC — randomized tags
 
 // ─────────────────────────────────────────────────────────────────────────────
 // pml4::g_mmonp_MmPfnDatabase definition

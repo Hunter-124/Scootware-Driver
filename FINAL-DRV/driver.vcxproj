@@ -116,66 +116,66 @@
     <ClInclude Include="CR3.h" />
     <ClInclude Include="communication.hpp" />
     <ClInclude Include="defines.h" />
-    <ClInclude Include="hwid_spoofer.hpp" />
+    <ClInclude Include="device_profile.hpp" />
     <ClInclude Include="imports.h" />
     <ClInclude Include="ipc_config.h" />
     <ClInclude Include="kcfg_patch.h" />
     <ClInclude Include="mouse.hpp" />
     <ClInclude Include="shared_memory_ipc.h" />
-    <ClInclude Include="syscall_stack_spoof.h" />
-    <ClInclude Include="thread_spoof.h" />
-    <ClInclude Include="injector\injector_api.hpp" />
-    <ClInclude Include="injector\injector_globals_init.hpp" />
-    <ClInclude Include="injector\def\def.hpp" />
-    <ClInclude Include="injector\def\ia32.hpp" />
-    <ClInclude Include="injector\def\globals.hpp" />
-    <ClInclude Include="injector\def\request.hpp" />
-    <ClInclude Include="injector\utils\raii.hpp" />
-    <ClInclude Include="injector\utils\intrin.hpp" />
-    <ClInclude Include="injector\utils\utils.hpp" />
-    <ClInclude Include="injector\mem\phys.hpp" />
-    <ClInclude Include="injector\mem\page_table.hpp" />
-    <ClInclude Include="injector\mem\mem.hpp" />
-    <ClInclude Include="injector\mem\validation.hpp" />
-    <ClInclude Include="injector\mem\detection.hpp" />
-    <ClInclude Include="injector\mem\pt_hook.hpp" />
-    <ClInclude Include="injector\mem\scan.hpp" />
-    <ClInclude Include="injector\mem\hyperspace.hpp" />
-    <ClInclude Include="injector\hde\hde.h" />
-    <ClInclude Include="injector\hde\hde32.h" />
-    <ClInclude Include="injector\hde\hde64.h" />
-    <ClInclude Include="injector\hde\hde_stdint.h" />
-    <ClInclude Include="injector\hde\table32.h" />
-    <ClInclude Include="injector\hde\table64.h" />
-    <ClInclude Include="injector\lib\cli.h" />
-    <ClInclude Include="injector\lib\ia_32.h" />
+    <ClInclude Include="syscall_stack_ctx.h" />
+    <ClInclude Include="thread_ctx.h" />
+    <ClInclude Include="loader\loader_api.hpp" />
+    <ClInclude Include="loader\loader_globals_init.hpp" />
+    <ClInclude Include="loader\def\def.hpp" />
+    <ClInclude Include="loader\def\ia32.hpp" />
+    <ClInclude Include="loader\def\globals.hpp" />
+    <ClInclude Include="loader\def\request.hpp" />
+    <ClInclude Include="loader\utils\raii.hpp" />
+    <ClInclude Include="loader\utils\intrin.hpp" />
+    <ClInclude Include="loader\utils\utils.hpp" />
+    <ClInclude Include="loader\mem\phys.hpp" />
+    <ClInclude Include="loader\mem\page_table.hpp" />
+    <ClInclude Include="loader\mem\mem.hpp" />
+    <ClInclude Include="loader\mem\validation.hpp" />
+    <ClInclude Include="loader\mem\detection.hpp" />
+    <ClInclude Include="loader\mem\pt_patch.hpp" />
+    <ClInclude Include="loader\mem\scan.hpp" />
+    <ClInclude Include="loader\mem\hyperspace.hpp" />
+    <ClInclude Include="loader\hde\hde.h" />
+    <ClInclude Include="loader\hde\hde32.h" />
+    <ClInclude Include="loader\hde\hde64.h" />
+    <ClInclude Include="loader\hde\hde_stdint.h" />
+    <ClInclude Include="loader\hde\table32.h" />
+    <ClInclude Include="loader\hde\table64.h" />
+    <ClInclude Include="loader\lib\cli.h" />
+    <ClInclude Include="loader\lib\ia_32.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="driver.cpp" />
-    <ClCompile Include="hwid_spoofer.cpp" />
+    <ClCompile Include="device_profile.cpp" />
     <ClCompile Include="mouse.cpp" />
-    <ClCompile Include="injector\injector_api.cpp" />
-    <ClCompile Include="injector\def\globals.cpp" />
-    <ClCompile Include="injector\utils\intrin.cpp" />
-    <ClCompile Include="injector\utils\utils.cpp" />
-    <ClCompile Include="injector\mem\phys.cpp" />
-    <ClCompile Include="injector\mem\page_table.cpp" />
-    <ClCompile Include="injector\mem\mem.cpp" />
-    <ClCompile Include="injector\mem\validation.cpp" />
-    <ClCompile Include="injector\mem\detection.cpp" />
-    <ClCompile Include="injector\mem\pt_hook.cpp" />
-    <ClCompile Include="injector\mem\hyperspace.cpp" />
-    <ClCompile Include="injector\hde\hde32.cpp" />
-    <ClCompile Include="injector\hde\hde64.cpp" />
+    <ClCompile Include="loader\loader_api.cpp" />
+    <ClCompile Include="loader\def\globals.cpp" />
+    <ClCompile Include="loader\utils\intrin.cpp" />
+    <ClCompile Include="loader\utils\utils.cpp" />
+    <ClCompile Include="loader\mem\phys.cpp" />
+    <ClCompile Include="loader\mem\page_table.cpp" />
+    <ClCompile Include="loader\mem\mem.cpp" />
+    <ClCompile Include="loader\mem\validation.cpp" />
+    <ClCompile Include="loader\mem\detection.cpp" />
+    <ClCompile Include="loader\mem\pt_patch.cpp" />
+    <ClCompile Include="loader\mem\hyperspace.cpp" />
+    <ClCompile Include="loader\hde\hde32.cpp" />
+    <ClCompile Include="loader\hde\hde64.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="spoof_thunk.asm">
+    <CustomBuild Include="stack_thunk.asm">
       <FileType>Document</FileType>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">ml64 /c /Fo"$(IntDir)\spoof_thunk.obj" "%(FullPath)"</Command>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\spoof_thunk.obj</Outputs>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">ml64 /c /Fo"$(IntDir)\stack_thunk.obj" "%(FullPath)"</Command>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\stack_thunk.obj</Outputs>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</LinkObjects>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ml64 /c /Fo"$(IntDir)\spoof_thunk.obj" "%(FullPath)"</Command>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\spoof_thunk.obj</Outputs>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ml64 /c /Fo"$(IntDir)\stack_thunk.obj" "%(FullPath)"</Command>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\stack_thunk.obj</Outputs>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkObjects>
     </CustomBuild>
   </ItemGroup>
