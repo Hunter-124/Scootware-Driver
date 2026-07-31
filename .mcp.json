@@ -4,7 +4,7 @@
       "type": "stdio",
       "command": "python",
       "args": ["-m", "drv_mcp"],
-      "cwd": "C:\\Users\\nigga\\Desktop\\Scootware-Master\\Driver\\DRV-MCP"
+      "cwd": "${workspaceFolder}"
     }
   }
 }
