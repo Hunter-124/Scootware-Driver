@@ -6,23 +6,6 @@ A kernel-mode read/write driver base implementing CR3 bypass and memory manipula
 
 ---
 
-## ⚠️ Known Issues
-
-This project contains several features with known stability or detection problems. Be aware before relying on any of them.
-
-### Page-Table (PT) Injector
-
-The PT injector has **known stability issues**. It operates by directly manipulating page-table structures to map physical memory into a target's CR3 context. This is inherently fragile — any race condition, incorrect PTE/PDE permission bit, or unexpected page-table state can trigger a kernel panic (BSOD). It is not yet suitable for production or reliability-sensitive workloads.
-
-### Mouse Input Implementation
-
-The mouse input feature uses `ObReferenceObjectByName` to resolve `\Driver\MouClass` and `\Driver\MouHID` driver objects, then walks device extensions to locate the mouse service callback and device object. This is a **well-known anti-cheat detection surface**. EAC and similar systems scan for these exact patterns (device extension pointer chasing on MouClass/MouHID) and flag any kernel module that performs them. Use of this method will be detected by modern anti-cheat scanners.
-
-### Thread Spoofing
-
-Thread spoofing (code-cave–based start-address spoofing via `ETHREAD.Win32StartAddress`) is **known to BSOD on bare metal** hardware. The cave scanner, KCFG bitmap validation, and ENDBR64-prefix patching interact badly with real hardware firmware/UEFI environments, especially when combined with EfiGuard-style compat modules. The feature works reliably in VMs with a kernel debugger attached, but on bare metal it produces `KMODE_EXCEPTION_NOT_HANDLED (0x1E)` with no bugcheck arguments or minidump on some configurations. See `FINAL-DRV/THREAD_SPOOF_HANDOFF.md` for the full debugging history.
-
----
 
 ## Project Structure
 
@@ -245,6 +228,22 @@ See the bundled `LICENSE` file for the full license text. Key terms:
 - **No warranty**: the software is provided "as is" without any warranty of any kind.
 
 > If you are redistributing or offering this software as a service, you must comply with the AGPL's network-copyleft provisions, including providing access to the complete corresponding source code.
+
+## ⚠️ Known Issues
+
+This project contains several features with known stability or detection problems. Be aware before relying on any of them.
+
+### Page-Table (PT) Injector
+
+The PT injector has **known stability issues**. It operates by directly manipulating page-table structures to map physical memory into a target's CR3 context. This is inherently fragile — any race condition, incorrect PTE/PDE permission bit, or unexpected page-table state can trigger a kernel panic (BSOD). It is not yet suitable for production or reliability-sensitive workloads.
+
+### Mouse Input Implementation
+
+The mouse input feature uses `ObReferenceObjectByName` to resolve `\Driver\MouClass` and `\Driver\MouHID` driver objects, then walks device extensions to locate the mouse service callback and device object. This is a **well-known anti-cheat detection surface**. EAC and similar systems scan for these exact patterns (device extension pointer chasing on MouClass/MouHID) and flag any kernel module that performs them. Use of this method will be detected by modern anti-cheat scanners.
+
+### Thread Spoofing
+
+Thread spoofing (code-cave–based start-address spoofing via `ETHREAD.Win32StartAddress`) is **known to BSOD on bare metal** hardware. The cave scanner, KCFG bitmap validation, and ENDBR64-prefix patching interact badly with real hardware firmware/UEFI environments, especially when combined with EfiGuard-style compat modules. The feature works reliably in VMs with a kernel debugger attached, but on bare metal it produces `KMODE_EXCEPTION_NOT_HANDLED (0x1E)` with no bugcheck arguments or minidump on some configurations. See `FINAL-DRV/THREAD_SPOOF_HANDOFF.md` for the full debugging history.
 
 ---
 
