@@ -229,6 +229,8 @@ See the bundled `LICENSE` file for the full license text. Key terms:
 
 > If you are redistributing or offering this software as a service, you must comply with the AGPL's network-copyleft provisions, including providing access to the complete corresponding source code.
 
+---
+
 ## ⚠️ Known Issues
 
 This project contains several features with known stability or detection problems. Be aware before relying on any of them.
