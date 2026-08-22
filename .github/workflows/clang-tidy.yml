@@ -1,0 +1,32 @@
+name: clang-tidy
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clang-tidy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-ipc-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+      - name: Configure IPC client with clang-tidy
+        shell: pwsh
+        run: |
+          clang-tidy --version
+          cmake -S IPC-Interface -B build/tidy -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+      - name: Analyze first-party IPC translation unit
+        run: cmake --build build/tidy

@@ -1,0 +1,26 @@
+---
+Checks: >
+  -*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  bugprone-*,
+  -bugprone-exception-escape,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  performance-*,
+  -performance-enum-size,
+  -performance-no-int-to-ptr,
+  portability-*,
+  -portability-avoid-pragma-once,
+  modernize-use-nullptr,
+  modernize-use-override,
+  readability-container-size-empty,
+  readability-duplicate-include,
+  readability-misleading-indentation,
+  readability-redundant-control-flow
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '(^|[/\\])(third_party|external|vendor|vcpkg|imgui-master|VisualUefi|Zydis|phnt|build|_deps)([/\\]|$)'
+SystemHeaders: false
+FormatStyle: none
+...
