@@ -1,11 +1,10 @@
-# Scootware-Driver
+# OVERVIEW
 
-A kernel-mode read/write driver base implementing CR3 bypass and memory manipulation primitives, designed for educational reverse engineering and dynamic analysis research.
-
-> **⚠️ Educational Use Only** — This software is strictly for learning about kernel internals, memory management, and anti-cheat bypass techniques in controlled environments. Using kernel drivers for memory manipulation in online games or production software violates terms of service, may result in permanent bans, and could expose you to legal liability. The authors assume no responsibility for misuse.
+A kernel-mode read/write primitive driver base implementing CR3 register manipulation for interacting with physical memory directly and doing the virtual -> physical address translations. included as well is also a stack spoofing bypass that make it look like we are calling windows functions both documented and undocumented), from within ntoskrnl.exe, hal.dll, and other common windows binaries. this can easily be defeated though since most anticheat programs will see that the runtime has been tampered with and if they fully unwind the stack they can still see our driver. this driver is designed for anti debugging and built to withstanding dynamic analysis reverse engineering attempts.
 
 ---
-
+#**Disclaimer***
+there's a lot of broken stuff in here, but the read primatives should be undetected on be/eac/ricochet but im not sure about writes. untested and likely not working on any other platform besides windows 10 22h2 19045. its on you to disable hvci, secure boot, and use a patchguard bypass, as well as a driver loader/mapping method of your choice.
 
 ## Project Structure
 
