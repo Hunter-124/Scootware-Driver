@@ -1,10 +1,34 @@
-# OVERVIEW
+# Scootware Driver
 
-A kernel-mode read/write primitive driver base implementing CR3 register manipulation for interacting with physical memory directly and doing the virtual -> physical address translations. included as well is also a stack spoofing bypass that make it look like we are calling windows functions both documented and undocumented), from within ntoskrnl.exe, hal.dll, and other common windows binaries. this can easily be defeated though since most anticheat programs will see that the runtime has been tampered with and if they fully unwind the stack they can still see our driver. this driver is designed for anti debugging and built to withstanding dynamic analysis reverse engineering attempts.
+An experimental Windows kernel driver and companion tools for low-level memory
+research in authorized test environments. The project combines a C++ driver,
+an ImGui control center, and a Python Model Context Protocol (MCP) server for
+process inspection and dynamic analysis.
 
----
-#**Disclaimer***
-there's a lot of broken stuff in here, but the read primatives should be undetected on be/eac/ricochet but im not sure about writes. untested and likely not working on any other platform besides windows 10 22h2 19045. its on you to disable hvci, secure boot, and use a patchguard bypass, as well as a driver loader/mapping method of your choice.
+**Engineering focus:** virtual-to-physical address translation, user/kernel
+shared-memory IPC, native desktop tooling, and an agent-facing analysis interface.
+
+> **Research prototype, not production software.** The original target is Windows
+> 10 22H2 (build 19045); broader compatibility is not established. Several
+> experimental features have known BSOD risks. Use only in isolated, authorized
+> lab environments. No claim of anti-cheat evasion or reliable writes is made.
+> Read [Known Issues](#known-issues) before attempting to run it.
+
+## Architecture preview
+
+```mermaid
+flowchart TD
+    GUI["ImGui control center<br/>C++ · IPC-Interface"] --> IPC["Shared-memory IPC"]
+    CLIENT["MCP client"] -->|"stdio JSON-RPC"| MCP["Python analysis server<br/>DRV-MCP"]
+    MCP --> HELPER["Native helper process<br/>scootware.exe"]
+    HELPER --> IPC
+    IPC <--> DRIVER["Windows kernel driver<br/>C++ · FINAL-DRV"]
+    DRIVER --> MEMORY["Address translation<br/>Physical memory access"]
+```
+
+The GUI and MCP helper are **alternative clients**, not simultaneous sessions:
+the driver attaches to one `scootware.exe` process at a time. This is an architecture
+diagram, not a runtime screenshot or a stability result.
 
 ## Project Structure
 
@@ -69,46 +93,6 @@ Scootware-Driver/
 ---
 
 ## Architecture Overview
-
-### High-Level Data Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        usermode (Ring 3)                           │
-│                                                                     │
-│  ┌──────────────┐   ┌──────────────────────┐   ┌────────────────┐  │
-│  │  scootware.exe │   │  DRV-MCP (Python)    │   │ IPC Speed Test │  │
-│  │  (ImGui GUI)   │   │  (MCP server for AI) │   │  (benchmark)   │  │
-│  └──────┬───────┘   └──────────┬───────────┘   └───────┬────────┘  │
-│         │                      │                         │           │
-│         │   Shared Memory      │  stdio JSON-RPC        │           │
-│         │   IPC (IPC_MAGIC)    │  via MCP protocol      │           │
-│         ▼                      ▼                         ▼           │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                    drv.sys (Kernel, Ring 0)                   │  │
-│  │                                                               │  │
-│  │  ┌─────────────────┐  ┌──────────────┐  ┌─────────────────┐  │  │
-│  │  │  IOCTL Dispatch  │  │  Stealth Pool │  │  PT Injector    │  │  │
-│  │  │  (driver.cpp)    │  │  Allocation   │  │  (known unstable)│  │  │
-│  │  └────────┬────────┘  └──────────────┘  └─────────────────┘  │  │
-│  │           │                                                    │  │
-│  │  ┌────────▼─────────────────────────────────────────────────┐  │  │
-│  │  │          CR3 Bypass + Physical Memory Primitives         │  │  │
-│  │  │  • MmCopyMemory (physical)                               │  │  │
-│  │  │  • MmMapIoSpaceEx                                        │  │  │
-│  │  │  • CR3 swap / direct CR3 R/W via physical translation   │  │  │
-│  │  │  • MmPfnDatabase walking for _MMPFN validation          │  │  │
-│  │  └──────────────────────────────────────────────────────────┘  │  │
-│  │                                                                │  │
-│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  │  │
-│  │  │  Mouse Input    │  │  HWID Spoofer  │  │  Thread Spoof  │  │  │
-│  │  │  (MouClass ext  │  │  (device_profile│  │  (code-cave    │  │  │
-│  │  │   scanning)     │  │   + registry)   │  │   BSOD-prone)  │  │  │
-│  │  └────────────────┘  └────────────────┘  └────────────────┘  │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
 
 ### Key Components
 
@@ -230,7 +214,7 @@ See the bundled `LICENSE` file for the full license text. Key terms:
 
 ---
 
-## ⚠️ Known Issues
+## Known Issues
 
 This project contains several features with known stability or detection problems. Be aware before relying on any of them.
 
