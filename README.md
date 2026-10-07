@@ -17,13 +17,13 @@ shared-memory IPC, native desktop tooling, and an agent-facing analysis interfac
 ## Architecture preview
 
 ```mermaid
-flowchart TD
-    GUI["ImGui control center<br/>C++ · IPC-Interface"] --> IPC["Shared-memory IPC"]
-    CLIENT["MCP client"] -->|"stdio JSON-RPC"| MCP["Python analysis server<br/>DRV-MCP"]
-    MCP --> HELPER["Native helper process<br/>scootware.exe"]
+flowchart LR
+    GUI["ImGui GUI<br/>C++"] --> IPC["Shared-memory<br/>IPC"]
+    CLIENT["MCP client"] -->|"stdio"| MCP["Analysis server<br/>Python"]
+    MCP --> HELPER["Native helper<br/>scootware.exe"]
     HELPER --> IPC
-    IPC <--> DRIVER["Windows kernel driver<br/>C++ · FINAL-DRV"]
-    DRIVER --> MEMORY["Address translation<br/>Physical memory access"]
+    IPC <--> DRIVER["Kernel driver<br/>C++"]
+    DRIVER --> MEMORY["Address translation<br/>Physical memory"]
 ```
 
 The GUI and MCP helper are **alternative clients**, not simultaneous sessions:
